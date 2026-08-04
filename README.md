@@ -1,5 +1,7 @@
 # ChangeGuard: Data Contract Sentinel
 
+![ChangeGuard project artwork](assets/changeguard-thumbnail.png)
+
 ChangeGuard is a DataHub-powered pre-deployment agent that prevents breaking
 data contract changes. It examines a proposed schema change, traces its
 downstream blast radius, calculates an explainable risk score, and creates a

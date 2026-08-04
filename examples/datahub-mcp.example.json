@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "datahub": {
+      "command": "uvx",
+      "args": ["mcp-server-datahub@0.6.0"],
+      "env": {
+        "DATAHUB_GMS_URL": "http://localhost:8080",
+        "DATAHUB_GMS_TOKEN": "SET_THIS_LOCALLY_AND_NEVER_COMMIT_IT",
+        "TOOLS_IS_MUTATION_ENABLED": "true",
+        "SAVE_DOCUMENT_TOOL_ENABLED": "true",
+        "SAVE_DOCUMENT_PARENT_TITLE": "ChangeGuard",
+        "SAVE_DOCUMENT_RESTRICT_UPDATES": "true",
+        "SEMANTIC_SEARCH_ENABLED": "false"
+      }
+    }
+  }
+}
+

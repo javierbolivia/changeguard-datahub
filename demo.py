@@ -1,12 +1,10 @@
 from contract_sentinel import Change, assess_change
+from contract_sentinel.fixtures import SHOWCASE_ASSETS
+from contract_sentinel.report import render_markdown
 
 
 change = Change(dataset="commerce.orders", column="customer_id", operation="rename")
-downstream = [
-    {"name": "Revenue Executive Dashboard", "kind": "dashboard", "critical": True},
-    {"name": "customer_lifetime_value", "kind": "dataset", "critical": True},
-    {"name": "Weekly Retention Report", "kind": "dashboard", "critical": False},
-]
+downstream = SHOWCASE_ASSETS
 impact = assess_change(change, downstream)
 
 print("CONTRACT SENTINEL — PRE-DEPLOYMENT REPORT")
@@ -18,4 +16,5 @@ for asset in impact.affected_assets:
 print("Migration checklist:")
 for item in impact.checklist:
     print(f"  [ ] {item}")
+print("\n" + render_markdown(change, impact, downstream))
 

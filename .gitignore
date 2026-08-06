@@ -6,3 +6,7 @@ venv/
 .env
 .streamlit/secrets.toml
 *.log
+*.err.log
+*.out.log
+.datahub/
+enable-wsl.ps1

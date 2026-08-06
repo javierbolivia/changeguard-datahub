@@ -1,0 +1,202 @@
+"""Live MCP connection handler for DataHub.
+
+This module manages the actual connection to the DataHub MCP server
+via stdio transport. It creates a real ToolCaller that the agent
+uses to communicate with DataHub.
+
+Usage:
+    from contract_sentinel.mcp_connection import create_live_adapter
+
+    adapter = await create_live_adapter(
+        datahub_url="http://localhost:8080",
+        datahub_token="your-token"
+    )
+    agent = ChangeGuardAgent(mcp_adapter=adapter)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from typing import Any
+
+from .datahub_mcp import DataHubMCPAdapter, ToolCaller
+
+
+class MCPStdioClient:
+    """Minimal MCP stdio client for communicating with mcp-server-datahub.
+
+    Implements the MCP protocol over stdin/stdout to communicate with
+    the official DataHub MCP server (npx @anthropic/mcp-server-datahub).
+    """
+
+    def __init__(self, process: asyncio.subprocess.Process):
+        self._process = process
+        self._request_id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: asyncio.Task | None = None
+        self._tools: set[str] = set()
+
+    @classmethod
+    async def connect(
+        cls,
+        datahub_url: str = "http://localhost:8080",
+        datahub_token: str | None = None,
+    ) -> "MCPStdioClient":
+        """Start the MCP server process and establish connection."""
+        env = {
+            **os.environ,
+            "DATAHUB_GMS_URL": datahub_url,
+        }
+        if datahub_token:
+            env["DATAHUB_TOKEN"] = datahub_token
+
+        # Start the MCP server
+        process = await asyncio.create_subprocess_exec(
+            "npx",
+            "-y",
+            "@anthropic/mcp-server-datahub@0.6.0",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        client = cls(process)
+        client._reader_task = asyncio.create_task(client._read_responses())
+
+        # Initialize the connection
+        await client._initialize()
+        return client
+
+    async def _initialize(self) -> None:
+        """Send the MCP initialize request and discover tools."""
+        response = await self._send_request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "changeguard", "version": "1.0.0"},
+        })
+
+        # List available tools
+        tools_response = await self._send_request("tools/list", {})
+        for tool in tools_response.get("tools", []):
+            self._tools.add(tool["name"])
+
+    async def _send_request(self, method: str, params: dict) -> dict:
+        """Send a JSON-RPC request and wait for the response."""
+        self._request_id += 1
+        request_id = self._request_id
+
+        message = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+
+        line = json.dumps(message) + "\n"
+        self._process.stdin.write(line.encode())
+        await self._process.stdin.drain()
+
+        # Wait for response
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+
+        try:
+            result = await asyncio.wait_for(future, timeout=30.0)
+            return result
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise TimeoutError(f"MCP request '{method}' timed out after 30s")
+
+    async def _read_responses(self) -> None:
+        """Background task to read responses from the MCP server."""
+        try:
+            while True:
+                line = await self._process.stdout.readline()
+                if not line:
+                    break
+
+                try:
+                    message = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    continue
+
+                request_id = message.get("id")
+                if request_id and request_id in self._pending:
+                    future = self._pending.pop(request_id)
+                    if "error" in message:
+                        future.set_exception(
+                            RuntimeError(
+                                f"MCP error: {message['error'].get('message', 'Unknown')}"
+                            )
+                        )
+                    else:
+                        future.set_result(message.get("result", {}))
+        except asyncio.CancelledError:
+            pass
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Call an MCP tool and return the result."""
+        response = await self._send_request("tools/call", {
+            "name": name,
+            "arguments": arguments,
+        })
+
+        # Parse the content from MCP response format
+        content = response.get("content", [])
+        if content and isinstance(content, list):
+            first = content[0]
+            if first.get("type") == "text":
+                try:
+                    return json.loads(first["text"])
+                except (json.JSONDecodeError, KeyError):
+                    return {"raw": first.get("text", "")}
+        return response
+
+    @property
+    def available_tools(self) -> set[str]:
+        return self._tools
+
+    async def close(self) -> None:
+        """Shut down the MCP server process."""
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self._process.stdin:
+            self._process.stdin.close()
+        self._process.terminate()
+        await self._process.wait()
+
+
+async def create_live_adapter(
+    datahub_url: str = "http://localhost:8080",
+    datahub_token: str | None = None,
+) -> DataHubMCPAdapter:
+    """Create a DataHubMCPAdapter connected to a live MCP server.
+
+    Args:
+        datahub_url: DataHub GMS URL (default: local quickstart)
+        datahub_token: Optional authentication token
+
+    Returns:
+        A configured DataHubMCPAdapter ready for use with ChangeGuardAgent
+
+    Raises:
+        RuntimeError: If the MCP server is missing required tools
+        ConnectionError: If the MCP server cannot be reached
+    """
+    try:
+        client = await MCPStdioClient.connect(datahub_url, datahub_token)
+    except Exception as e:
+        raise ConnectionError(
+            f"Failed to connect to DataHub MCP server at {datahub_url}: {e}"
+        ) from e
+
+    adapter = DataHubMCPAdapter(
+        call_tool=client.call_tool,
+        available_tools=client.available_tools,
+    )
+    return adapter

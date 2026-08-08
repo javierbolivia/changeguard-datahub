@@ -79,28 +79,73 @@ st.divider()
 
 # ─── Sidebar: Change Configuration ───────────────────────────────────────────
 
+# Session-state defaults for the form fields, so the example buttons below
+# can pre-fill them without triggering Run Agent.
+if "cg_dataset" not in st.session_state:
+    st.session_state.cg_dataset = "commerce.orders"
+if "cg_column" not in st.session_state:
+    st.session_state.cg_column = "customer_id"
+if "cg_operation" not in st.session_state:
+    st.session_state.cg_operation = "rename"
+if "cg_new_value" not in st.session_state:
+    st.session_state.cg_new_value = "cust_key"
+
+
+def _load_safe_rename_example() -> None:
+    st.session_state.cg_dataset = "commerce.orders"
+    st.session_state.cg_column = "customer_id"
+    st.session_state.cg_operation = "rename"
+    st.session_state.cg_new_value = "cust_key"
+
+
+def _load_dangerous_drop_example() -> None:
+    st.session_state.cg_dataset = "commerce.orders"
+    st.session_state.cg_column = "customer_id"
+    st.session_state.cg_operation = "drop"
+    st.session_state.cg_new_value = ""
+
+
 with st.sidebar:
     st.header("\U0001f527 Proposed Schema Change")
+
+    st.markdown("**Quick examples:**")
+    ex_col1, ex_col2 = st.columns(2)
+    with ex_col1:
+        st.button(
+            "\u25b6 Safe Rename",
+            use_container_width=True,
+            on_click=_load_safe_rename_example,
+            help="Fills the form with a low-risk rename example. Does not run the agent.",
+        )
+    with ex_col2:
+        st.button(
+            "\U0001f6d1 Dangerous Drop",
+            use_container_width=True,
+            on_click=_load_dangerous_drop_example,
+            help="Fills the form with a high-risk drop example. Does not run the agent.",
+        )
+
     st.markdown("Configure the change you want to evaluate:")
 
     dataset = st.text_input(
         "Dataset",
-        value="commerce.orders",
+        key="cg_dataset",
         help="Fully qualified dataset name (schema.table)",
     )
     column = st.text_input(
         "Column",
-        value="customer_id",
+        key="cg_column",
         help="The column being modified",
     )
     operation = st.selectbox(
         "Operation",
         ["rename", "drop", "type_change", "add"],
+        key="cg_operation",
         help="Type of schema change",
     )
     new_value = st.text_input(
         "New name / type (optional)",
-        value="cust_key" if operation == "rename" else "",
+        key="cg_new_value",
         help="For rename: new column name. For type_change: new data type.",
     )
 

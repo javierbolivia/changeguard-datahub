@@ -210,7 +210,9 @@ ChangeGuard uses **deterministic, explainable rules** instead of opaque LLM judg
 | Per critical asset (capped at 20) | +10 |
 | Per business dashboard (capped at 10) | +5 |
 
-**Decision thresholds:** Critical (≥80) → BLOCK | High (≥60) → BLOCK | Medium (≥30) → WARN | Low (<30) → ALLOW
+**Severity thresholds:** Critical (≥80) | High (≥60) | Medium (≥30) | Low (<30)
+
+**Deployment decision:** the agent only outputs two decisions, `BLOCK` or `ALLOW` — there is no separate "warn" state. Critical and High severity → **BLOCK** (the migration checklist must be completed first). Medium and Low severity → **ALLOW** ("change may proceed"), meaning the change is not blocked but still carries risk: review the "Why Flagged" reasons and the migration checklist before deploying, especially at Medium severity.
 
 ---
 

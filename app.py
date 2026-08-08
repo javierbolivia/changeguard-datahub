@@ -189,6 +189,10 @@ The agent uses DataHub's MCP Server tools:
 | Per dashboard (max 10) | +5 each |
 
 **Severity thresholds:** Critical ≥80, High ≥60, Medium ≥30, Low <30
+
+**Deployment decision:** Critical/High → BLOCK. Medium/Low → ALLOW
+(change may proceed, but review the reasons and checklist — Medium
+severity is not risk-free, it is simply not blocked).
 """
         )
     st.stop()
@@ -339,8 +343,9 @@ if result.impact:
         )
     else:
         st.success(
-            f"\u2705 **CHANGE ALLOWED** — Risk score {result.impact.score}/100. "
-            f"Proceed with standard validation."
+            f"\u2705 **CHANGE ALLOWED** — Risk score {result.impact.score}/100 "
+            f"({result.impact.severity}). Not blocked, but review the reasons "
+            f"and checklist below before deploying."
         )
 
     # Detailed sections in tabs

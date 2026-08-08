@@ -19,7 +19,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertIsInstance(result, AgentResult)
         self.assertEqual(result.mode, "demo")
-        self.assertEqual(len(result.steps), 8)
+        self.assertEqual(len(result.steps), 9)
         self.assertIsNotNone(result.impact)
         self.assertIsNotNone(result.report)
         self.assertEqual(result.impact.severity, "critical")
@@ -30,8 +30,8 @@ class AgentTests(unittest.TestCase):
         agent = ChangeGuardAgent(on_step_update=lambda s: events.append(s.status))
         agent.run(Change("commerce.orders", "customer_id", "drop"))
 
-        # Each step emits RUNNING + final status = at least 16 events (8 steps)
-        self.assertGreaterEqual(len(events), 16)
+        # Each step emits RUNNING + final status = at least 18 events (9 steps)
+        self.assertGreaterEqual(len(events), 18)
         # All steps complete (SUCCESS or SKIPPED)
         final_statuses = [events[i] for i in range(1, len(events), 2)]
         for status in final_statuses:
@@ -190,7 +190,13 @@ class LiveModeShapeTests(unittest.TestCase):
     def test_fetch_lineage_parses_real_downstreams_shape(self):
         async def caller(name, arguments):
             if name == "search":
-                return {"searchResults": []}
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
             if name == "get_lineage":
                 return {
                     "downstreams": {
@@ -226,7 +232,13 @@ class LiveModeShapeTests(unittest.TestCase):
     def test_live_mode_never_falls_back_to_fixtures_on_lineage_error(self):
         async def caller(name, arguments):
             if name == "search":
-                return {"searchResults": []}
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
             if name == "get_lineage":
                 raise ConnectionError("DataHub GMS unreachable")
             raise AssertionError(f"unexpected tool call: {name}")
@@ -255,6 +267,132 @@ class LiveModeShapeTests(unittest.TestCase):
         self.assertEqual(resolve_step.status, StepStatus.FAILED)
         self.assertIsNone(result.impact)
         self.assertEqual(result.downstream_assets, [])
+
+    def test_live_mode_stops_when_dataset_not_found(self):
+        """search returning zero results (no error) must stop the agent,
+        not construct a guessed URN and continue."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {"total": 0}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.this_does_not_exist", "customer_id", "rename")
+        )
+
+        resolve_step = next(s for s in result.steps if s.name == "resolve_urn")
+        self.assertEqual(resolve_step.status, StepStatus.FAILED)
+        self.assertIn("not found", resolve_step.error)
+        self.assertIsNone(result.impact)
+        self.assertFalse(result.writeback_success)
+        # Only the parse + resolve_urn steps should have run.
+        self.assertEqual(len(result.steps), 2)
+
+    def test_live_mode_stops_when_column_not_found(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {
+                    "fields": [
+                        {"fieldPath": "order_id"},
+                        {"fieldPath": "customer_id"},
+                        {"fieldPath": "amount"},
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "this_column_does_not_exist", "rename")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.FAILED)
+        self.assertIn("this_column_does_not_exist", validate_step.error)
+        self.assertIn("not found", validate_step.error)
+        self.assertIsNone(result.impact)
+        self.assertFalse(result.writeback_success)
+
+    def test_live_mode_rejects_rename_to_existing_column(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {
+                    "fields": [
+                        {"fieldPath": "order_id"},
+                        {"fieldPath": "customer_id"},
+                        {"fieldPath": "amount"},
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "rename", new_type="order_id")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.FAILED)
+        self.assertIn("already exists", validate_step.error)
+        self.assertIsNone(result.impact)
+        self.assertFalse(result.writeback_success)
+
+    def test_live_mode_passes_schema_validation_for_valid_column(self):
+        """Sanity check: a real, existing column must not be rejected."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {
+                    "fields": [
+                        {"fieldPath": "order_id"},
+                        {"fieldPath": "customer_id"},
+                        {"fieldPath": "amount"},
+                    ]
+                }
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "rename", new_type="cust_key")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.SUCCESS)
+        self.assertIsNotNone(result.impact)
+
+    def test_demo_mode_skips_schema_validation(self):
+        """Demo mode has no live schema to check against and must keep
+        its existing behavior (no MCP calls at all)."""
+        agent = ChangeGuardAgent()
+        result = agent.run(Change("commerce.orders", "customer_id", "rename"))
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.SKIPPED)
+        self.assertIsNotNone(result.impact)
 
 
 if __name__ == "__main__":

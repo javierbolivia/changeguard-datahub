@@ -218,11 +218,11 @@ proposes a schema change (rename, drop, type change), the agent:
 6. **Writes back** the decision to DataHub so the team inherits context
 7. **Decides** to BLOCK or ALLOW the deployment
 
-The agent uses DataHub's MCP Server tools:
-- `search` — find datasets by name
+The agent uses these DataHub MCP Server tools:
+- `search` — find the dataset by name
 - `get_lineage` — column-level downstream traversal
-- `get_entities` — asset metadata and ownership
-- `save_document` — write impact reports back to DataHub
+- `list_schema_fields` — verify the dataset and column exist before scoring
+- `save_document` — optionally write the impact report back to DataHub
 """
         )
 
@@ -275,6 +275,7 @@ STEP_ICONS = {
 STEP_NAMES = {
     "parse_change": "Parse & Validate Change",
     "resolve_urn": "Resolve Dataset in DataHub",
+    "validate_schema": "Validate Column Against Schema",
     "fetch_lineage": "Fetch Downstream Lineage",
     "assess_risk": "Calculate Risk Score",
     "generate_report": "Generate Impact Report",
@@ -303,9 +304,9 @@ def render_step(step: AgentStep, placeholder) -> None:
         placeholder.markdown(f"{icon} **{label}** — Pending")
 
 
-# Pre-create 8 placeholders
+# Pre-create 9 placeholders
 with step_container:
-    for _ in range(8):
+    for _ in range(9):
         steps_placeholders.append(st.empty())
 
 # Track step index
@@ -452,7 +453,7 @@ if result.impact:
     with st.expander("\u23f1\ufe0f Execution Summary"):
         total_ms = sum(s.duration_ms for s in result.steps)
         st.write(f"**Total execution time:** {total_ms:.0f}ms")
-        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/8")
+        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/9")
         st.write(f"**Data source:** {result.mode}")
         for step in result.steps:
             icon = STEP_ICONS.get(step.status, "?")

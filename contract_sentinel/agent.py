@@ -165,9 +165,15 @@ class ChangeGuardAgent:
                     dataset_urn = entities[0].get("entity", {}).get("urn")
                     step2.result = {"urn": dataset_urn, "source": "datahub_search"}
                 else:
-                    # Construct a plausible URN
-                    dataset_urn = f"urn:li:dataset:(urn:li:dataPlatform:snowflake,{change.dataset},PROD)"
-                    step2.result = {"urn": dataset_urn, "source": "constructed"}
+                    # Live mode: never guess a URN for a dataset DataHub
+                    # does not know about. Stop the analysis outright so a
+                    # nonexistent dataset can never produce a risk score,
+                    # an ALLOW/BLOCK decision, or a writeback.
+                    step2.status = StepStatus.FAILED
+                    step2.error = f"Dataset not found in DataHub: {change.dataset}"
+                    step2.duration_ms = (time.perf_counter() - t0) * 1000
+                    self._emit(step2)
+                    return result
             else:
                 # Demo mode: construct URN from naming convention
                 dataset_urn = f"urn:li:dataset:(urn:li:dataPlatform:snowflake,{change.dataset},PROD)"
@@ -190,6 +196,66 @@ class ChangeGuardAgent:
             step2.result = {"urn": dataset_urn, "source": "fallback"}
             step2.status = StepStatus.SUCCESS
         self._emit(step2)
+
+        # Step 2b: Validate the column (and, for rename, the target name)
+        # against the real DataHub schema. Live mode only — Demo mode has
+        # no live schema to check against and keeps its existing behavior.
+        step2b = AgentStep(
+            name="validate_schema",
+            description=f"Validating column '{change.column}' against DataHub schema",
+        )
+        result.steps.append(step2b)
+        step2b.status = StepStatus.RUNNING
+        self._emit(step2b)
+        t0 = time.perf_counter()
+
+        if self._mcp and dataset_urn:
+            try:
+                schema_result = await self._mcp._call_tool(
+                    "list_schema_fields", {"urn": dataset_urn}
+                )
+                field_names = {
+                    f.get("fieldPath") for f in schema_result.get("fields", [])
+                }
+
+                if change.column not in field_names:
+                    step2b.status = StepStatus.FAILED
+                    step2b.error = (
+                        f"Column '{change.column}' was not found in dataset "
+                        f"'{change.dataset}'"
+                    )
+                    step2b.duration_ms = (time.perf_counter() - t0) * 1000
+                    self._emit(step2b)
+                    return result
+
+                if (
+                    change.operation == "rename"
+                    and change.new_type
+                    and change.new_type in field_names
+                ):
+                    step2b.status = StepStatus.FAILED
+                    step2b.error = (
+                        f"Cannot rename '{change.column}' to '{change.new_type}': "
+                        f"target column already exists."
+                    )
+                    step2b.duration_ms = (time.perf_counter() - t0) * 1000
+                    self._emit(step2b)
+                    return result
+
+                step2b.result = {"fields_checked": len(field_names)}
+                step2b.status = StepStatus.SUCCESS
+                step2b.duration_ms = (time.perf_counter() - t0) * 1000
+            except Exception as e:
+                step2b.status = StepStatus.FAILED
+                step2b.error = str(e)
+                step2b.duration_ms = (time.perf_counter() - t0) * 1000
+                self._emit(step2b)
+                return result
+        else:
+            step2b.status = StepStatus.SKIPPED
+            step2b.result = {"reason": "Demo mode — no live schema to validate against"}
+            step2b.duration_ms = (time.perf_counter() - t0) * 1000
+        self._emit(step2b)
 
         # Step 3: Fetch downstream column-level lineage
         step3 = AgentStep(

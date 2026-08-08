@@ -5,6 +5,7 @@ evaluating schema change risk by tracing downstream lineage in DataHub.
 """
 
 import asyncio
+import functools
 import time
 
 import streamlit as st
@@ -15,6 +16,7 @@ from contract_sentinel.agent import (
     ChangeGuardAgent,
     StepStatus,
 )
+from contract_sentinel.datahub_writeback import write_decision_to_datahub
 from contract_sentinel.mcp_connection import create_live_adapter
 from contract_sentinel.risk import Change
 
@@ -159,9 +161,13 @@ with st.sidebar:
         help="Demo uses reproducible sample data. Live connects to DataHub.",
     )
     confirm_wb = st.checkbox(
-        "Write report back to DataHub",
+        "Persist decision to DataHub",
         value=False,
-        help="If checked and in Live mode, saves the impact report to DataHub.",
+        help=(
+            "If checked and in Live mode, writes the ChangeGuard decision "
+            "(ALLOW/BLOCK, score, severity, operation, column, timestamp) "
+            "as custom properties on the dataset in DataHub."
+        ),
     )
 
     datahub_url = "http://localhost:8080"
@@ -274,6 +280,7 @@ STEP_NAMES = {
     "generate_report": "Generate Impact Report",
     "writeback": "Write Back to DataHub",
     "decision": "Deployment Decision",
+    "persist_decision": "Persist Decision to DataHub",
 }
 
 
@@ -296,9 +303,9 @@ def render_step(step: AgentStep, placeholder) -> None:
         placeholder.markdown(f"{icon} **{label}** — Pending")
 
 
-# Pre-create 7 placeholders
+# Pre-create 8 placeholders
 with step_container:
-    for _ in range(7):
+    for _ in range(8):
         steps_placeholders.append(st.empty())
 
 # Track step index
@@ -340,8 +347,19 @@ async def execute_agent() -> tuple[AgentResult | None, str | None]:
         except Exception as e:
             return None, str(e)
 
+    writeback_fn = None
+    if use_live:
+        writeback_fn = functools.partial(
+            write_decision_to_datahub,
+            datahub_url or "http://localhost:8080",
+        )
+
     try:
-        agent = ChangeGuardAgent(mcp_adapter=mcp_adapter, on_step_update=on_step_update)
+        agent = ChangeGuardAgent(
+            mcp_adapter=mcp_adapter,
+            on_step_update=on_step_update,
+            writeback_fn=writeback_fn,
+        )
         result = await agent.run_async(change, confirm_writeback=confirm_wb)
         return result, None
     finally:
@@ -434,7 +452,7 @@ if result.impact:
     with st.expander("\u23f1\ufe0f Execution Summary"):
         total_ms = sum(s.duration_ms for s in result.steps)
         st.write(f"**Total execution time:** {total_ms:.0f}ms")
-        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/7")
+        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/8")
         st.write(f"**Data source:** {result.mode}")
         for step in result.steps:
             icon = STEP_ICONS.get(step.status, "?")

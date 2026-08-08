@@ -25,6 +25,12 @@ from .fixtures import SHOWCASE_ASSETS
 from .report import render_markdown
 from .risk import Change, Impact, assess_change
 
+# Callable signature for a persistent DataHub writeback function, e.g.
+# contract_sentinel.datahub_writeback.write_decision_to_datahub bound with
+# its connection args via functools.partial. Kept as a plain Callable so
+# the agent has no import-time dependency on the DataHub SDK.
+WritebackFn = Callable[[str, str, int, str, str, str], Any]
+
 
 class StepStatus(str, Enum):
     PENDING = "pending"
@@ -75,9 +81,11 @@ class ChangeGuardAgent:
         self,
         mcp_adapter: DataHubMCPAdapter | None = None,
         on_step_update: StepCallback | None = None,
+        writeback_fn: WritebackFn | None = None,
     ):
         self._mcp = mcp_adapter
         self._on_step = on_step_update or (lambda _: None)
+        self._writeback_fn = writeback_fn
 
     @property
     def mode(self) -> str:
@@ -365,6 +373,47 @@ class ChangeGuardAgent:
         step7.status = StepStatus.SUCCESS
         step7.duration_ms = (time.perf_counter() - t0) * 1000
         self._emit(step7)
+
+        # Step 8: Persist the decision to DataHub (optional, requires
+        # confirmation). Independent of step 6 / save_document: this uses
+        # the official DataHub SDK to write custom properties on the
+        # dataset, which works even when save_document is unavailable.
+        step8 = AgentStep(
+            name="persist_decision",
+            description="Persisting ChangeGuard decision to DataHub as custom properties",
+        )
+        result.steps.append(step8)
+        step8.status = StepStatus.RUNNING
+        self._emit(step8)
+        t0 = time.perf_counter()
+
+        if not confirm_writeback:
+            step8.status = StepStatus.SKIPPED
+            step8.result = {"reason": "Writeback requires explicit user confirmation"}
+            step8.duration_ms = (time.perf_counter() - t0) * 1000
+        elif not self._writeback_fn:
+            step8.status = StepStatus.SKIPPED
+            step8.result = {"reason": "No writeback function configured (demo mode or none provided)"}
+            step8.duration_ms = (time.perf_counter() - t0) * 1000
+        else:
+            try:
+                record = self._writeback_fn(
+                    change.dataset,
+                    decision,
+                    impact.score,
+                    impact.severity,
+                    change.operation,
+                    change.column,
+                )
+                result.writeback_success = True
+                step8.result = {"written": True, "record": record}
+                step8.status = StepStatus.SUCCESS
+                step8.duration_ms = (time.perf_counter() - t0) * 1000
+            except Exception as e:
+                step8.status = StepStatus.FAILED
+                step8.error = str(e)
+                step8.duration_ms = (time.perf_counter() - t0) * 1000
+        self._emit(step8)
 
         return result
 

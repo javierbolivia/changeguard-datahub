@@ -19,7 +19,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertIsInstance(result, AgentResult)
         self.assertEqual(result.mode, "demo")
-        self.assertEqual(len(result.steps), 7)
+        self.assertEqual(len(result.steps), 8)
         self.assertIsNotNone(result.impact)
         self.assertIsNotNone(result.report)
         self.assertEqual(result.impact.severity, "critical")
@@ -30,8 +30,8 @@ class AgentTests(unittest.TestCase):
         agent = ChangeGuardAgent(on_step_update=lambda s: events.append(s.status))
         agent.run(Change("commerce.orders", "customer_id", "drop"))
 
-        # Each step emits RUNNING + final status = at least 14 events
-        self.assertGreaterEqual(len(events), 14)
+        # Each step emits RUNNING + final status = at least 16 events (8 steps)
+        self.assertGreaterEqual(len(events), 16)
         # All steps complete (SUCCESS or SKIPPED)
         final_statuses = [events[i] for i in range(1, len(events), 2)]
         for status in final_statuses:
@@ -56,6 +56,72 @@ class AgentTests(unittest.TestCase):
 
         wb_step = next(s for s in result.steps if s.name == "writeback")
         self.assertEqual(wb_step.status, StepStatus.SKIPPED)
+
+    def test_persist_decision_skipped_without_confirmation(self):
+        calls = []
+        agent = ChangeGuardAgent(writeback_fn=lambda *a: calls.append(a))
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=False,
+        )
+
+        persist_step = next(s for s in result.steps if s.name == "persist_decision")
+        self.assertEqual(persist_step.status, StepStatus.SKIPPED)
+        self.assertEqual(calls, [])
+        self.assertFalse(result.writeback_success)
+
+    def test_persist_decision_skipped_without_writeback_fn(self):
+        agent = ChangeGuardAgent()
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        persist_step = next(s for s in result.steps if s.name == "persist_decision")
+        self.assertEqual(persist_step.status, StepStatus.SKIPPED)
+        self.assertFalse(result.writeback_success)
+
+    def test_persist_decision_calls_writeback_fn_with_confirmation(self):
+        calls = []
+
+        def fake_writeback(dataset, decision, score, severity, operation, column):
+            calls.append((dataset, decision, score, severity, operation, column))
+            return {"dataset_urn": f"urn:li:dataset:(x,{dataset},PROD)"}
+
+        agent = ChangeGuardAgent(writeback_fn=fake_writeback)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        persist_step = next(s for s in result.steps if s.name == "persist_decision")
+        self.assertEqual(persist_step.status, StepStatus.SUCCESS)
+        self.assertTrue(result.writeback_success)
+        self.assertEqual(len(calls), 1)
+        dataset, decision, score, severity, operation, column = calls[0]
+        self.assertEqual(dataset, "commerce.orders")
+        self.assertEqual(decision, "BLOCK")
+        self.assertEqual(operation, "drop")
+        self.assertEqual(column, "customer_id")
+        self.assertEqual(score, result.impact.score)
+        self.assertEqual(severity, result.impact.severity)
+
+    def test_persist_decision_failure_does_not_crash_agent(self):
+        def failing_writeback(*args):
+            raise ConnectionError("DataHub GMS unreachable")
+
+        agent = ChangeGuardAgent(writeback_fn=failing_writeback)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        persist_step = next(s for s in result.steps if s.name == "persist_decision")
+        self.assertEqual(persist_step.status, StepStatus.FAILED)
+        self.assertIn("unreachable", persist_step.error)
+        self.assertFalse(result.writeback_success)
+        # The rest of the result (impact/report) must remain intact.
+        self.assertIsNotNone(result.impact)
 
     def test_agent_all_steps_have_positive_duration(self):
         agent = ChangeGuardAgent()

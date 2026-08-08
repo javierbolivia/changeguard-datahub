@@ -148,12 +148,13 @@ class ChangeGuardAgent:
             if self._mcp:
                 # Live mode: search DataHub for the dataset
                 search_result = await self._mcp._call_tool(
-                    "search",
-                    {"query": change.dataset, "types": ["dataset"], "count": 1},
+                    "search", {"query": change.dataset}
                 )
-                entities = search_result.get("results", [])
+                # mcp-server-datahub returns results nested as
+                # {"searchResults": [{"entity": {"urn": ..., ...}}, ...]}
+                entities = search_result.get("searchResults", [])
                 if entities:
-                    dataset_urn = entities[0].get("urn")
+                    dataset_urn = entities[0].get("entity", {}).get("urn")
                     step2.result = {"urn": dataset_urn, "source": "datahub_search"}
                 else:
                     # Construct a plausible URN
@@ -170,7 +171,13 @@ class ChangeGuardAgent:
             step2.status = StepStatus.FAILED
             step2.error = str(e)
             step2.duration_ms = (time.perf_counter() - t0) * 1000
-            # Non-fatal: continue with constructed URN
+            self._emit(step2)
+            if self._mcp:
+                # Live mode: a real DataHub/MCP failure must surface as a
+                # real error, not be silently papered over with demo data.
+                return result
+            # Demo mode: no live connection was ever attempted, so a
+            # constructed URN following naming convention is acceptable.
             dataset_urn = f"urn:li:dataset:(urn:li:dataPlatform:snowflake,{change.dataset},PROD)"
             step2.result = {"urn": dataset_urn, "source": "fallback"}
             step2.status = StepStatus.SUCCESS
@@ -192,17 +199,23 @@ class ChangeGuardAgent:
                 lineage_data = await self._mcp.downstream_lineage(
                     dataset_urn, change.column
                 )
-                # Transform MCP response to our asset format
-                raw_assets = lineage_data.get("results", [])
-                for asset in raw_assets:
+                # mcp-server-datahub returns downstream lineage nested as
+                # {"downstreams": {"searchResults": [{"entity": {...}, ...}]}}
+                raw_assets = lineage_data.get("downstreams", {}).get("searchResults", [])
+                for item in raw_assets:
+                    entity = item.get("entity", {})
+                    urn = entity.get("urn", "")
+                    name = entity.get("name") or entity.get("properties", {}).get(
+                        "name", urn or "Unknown"
+                    )
                     downstream.append(
                         {
-                            "name": asset.get("name", asset.get("urn", "Unknown")),
-                            "urn": asset.get("urn", ""),
-                            "kind": _classify_asset(asset),
-                            "critical": asset.get("critical", False),
-                            "owner": asset.get("owner", "Unknown"),
-                            "path": asset.get("path", "lineage path from DataHub"),
+                            "name": name,
+                            "urn": urn,
+                            "kind": _classify_asset(entity),
+                            "critical": False,
+                            "owner": "Unknown",
+                            "path": f"{change.dataset}.{change.column} -> {name}",
                         }
                     )
                 step3.result = {
@@ -223,7 +236,14 @@ class ChangeGuardAgent:
             step3.status = StepStatus.FAILED
             step3.error = str(e)
             step3.duration_ms = (time.perf_counter() - t0) * 1000
-            # Fallback to fixtures
+            self._emit(step3)
+            if self._mcp:
+                # Live mode: do not mask a real DataHub/MCP failure by
+                # silently substituting demo fixtures.
+                return result
+            # Demo mode: no live connection was attempted, fixtures are
+            # the intended data source, so this path should not normally
+            # be reached, but fixtures remain the correct fallback here.
             downstream = SHOWCASE_ASSETS.copy()
             step3.result = {"source": "fallback_fixtures", "assets_found": len(downstream)}
             step3.status = StepStatus.SUCCESS

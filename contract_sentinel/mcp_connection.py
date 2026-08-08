@@ -1,15 +1,23 @@
 """Live MCP connection handler for DataHub.
 
-This module manages the actual connection to the DataHub MCP server
-via stdio transport. It creates a real ToolCaller that the agent
-uses to communicate with DataHub.
+This module manages the actual connection to the official, open-source
+DataHub MCP server (https://github.com/acryldata/mcp-server-datahub),
+launched via ``uvx`` over stdio. It creates a real ToolCaller that the
+agent uses to communicate with a running DataHub instance.
+
+Requires:
+    - ``uv``/``uvx`` installed (https://docs.astral.sh/uv/getting-started/installation/)
+    - A running DataHub instance (e.g. ``datahub docker quickstart``)
+    - A DataHub personal access token, if the instance has authentication
+      enabled. The default local quickstart runs with authentication
+      disabled, so ``datahub_token`` may be omitted for local development.
 
 Usage:
     from contract_sentinel.mcp_connection import create_live_adapter
 
     adapter = await create_live_adapter(
         datahub_url="http://localhost:8080",
-        datahub_token="your-token"
+        datahub_token=None,  # or a personal access token
     )
     agent = ChangeGuardAgent(mcp_adapter=adapter)
 """
@@ -19,8 +27,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
-import sys
 from typing import Any
 
 from .datahub_mcp import DataHubMCPAdapter, ToolCaller
@@ -29,8 +35,10 @@ from .datahub_mcp import DataHubMCPAdapter, ToolCaller
 class MCPStdioClient:
     """Minimal MCP stdio client for communicating with mcp-server-datahub.
 
-    Implements the MCP protocol over stdin/stdout to communicate with
-    the official DataHub MCP server (npx @anthropic/mcp-server-datahub).
+    Implements the MCP protocol over stdin/stdout to communicate with the
+    official, open-source DataHub MCP server
+    (https://github.com/acryldata/mcp-server-datahub), launched via
+    ``uvx mcp-server-datahub@latest``.
     """
 
     def __init__(self, process: asyncio.subprocess.Process):
@@ -46,19 +54,23 @@ class MCPStdioClient:
         datahub_url: str = "http://localhost:8080",
         datahub_token: str | None = None,
     ) -> "MCPStdioClient":
-        """Start the MCP server process and establish connection."""
+        """Start the official mcp-server-datahub process and connect to it.
+
+        Launches ``uvx mcp-server-datahub@latest`` with the DataHub
+        connection details passed via the environment variables the
+        server expects: ``DATAHUB_GMS_URL`` and ``DATAHUB_GMS_TOKEN``.
+        """
         env = {
             **os.environ,
             "DATAHUB_GMS_URL": datahub_url,
         }
         if datahub_token:
-            env["DATAHUB_TOKEN"] = datahub_token
+            env["DATAHUB_GMS_TOKEN"] = datahub_token
 
-        # Start the MCP server
+        # Start the official DataHub MCP server via uvx
         process = await asyncio.create_subprocess_exec(
-            "npx",
-            "-y",
-            "@anthropic/mcp-server-datahub@0.6.0",
+            "uvx",
+            "mcp-server-datahub@latest",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -73,17 +85,36 @@ class MCPStdioClient:
         return client
 
     async def _initialize(self) -> None:
-        """Send the MCP initialize request and discover tools."""
-        response = await self._send_request("initialize", {
+        """Perform the MCP initialization handshake and discover tools.
+
+        Per the MCP spec, the client must: send ``initialize``, wait for the
+        server's response, then send the ``notifications/initialized``
+        notification before issuing any other request (e.g. ``tools/list``).
+        """
+        await self._send_request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "changeguard", "version": "1.0.0"},
         })
 
+        # Required notification with no "id" and no response expected.
+        await self._send_notification("notifications/initialized", {})
+
         # List available tools
         tools_response = await self._send_request("tools/list", {})
         for tool in tools_response.get("tools", []):
             self._tools.add(tool["name"])
+
+    async def _send_notification(self, method: str, params: dict) -> None:
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        message = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+        line = json.dumps(message) + "\n"
+        self._process.stdin.write(line.encode())
+        await self._process.stdin.drain()
 
     async def _send_request(self, method: str, params: dict) -> dict:
         """Send a JSON-RPC request and wait for the response."""
@@ -195,8 +226,16 @@ async def create_live_adapter(
             f"Failed to connect to DataHub MCP server at {datahub_url}: {e}"
         ) from e
 
-    adapter = DataHubMCPAdapter(
-        call_tool=client.call_tool,
-        available_tools=client.available_tools,
-    )
+    try:
+        adapter = DataHubMCPAdapter(
+            call_tool=client.call_tool,
+            available_tools=client.available_tools,
+            close=client.close,
+        )
+    except Exception:
+        # The stdio client/subprocess was already started; if adapter
+        # construction fails (e.g. a required tool is missing), close it
+        # here so we do not leak the mcp-server-datahub subprocess.
+        await client.close()
+        raise
     return adapter

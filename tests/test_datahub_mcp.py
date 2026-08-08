@@ -43,6 +43,36 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             DataHubMCPAdapter(caller, {"search"})
 
+    def test_save_document_is_optional_for_connecting(self):
+        """save_document is a Document Tool that mcp-server-datahub hides
+        when no documents exist yet. Its absence must not block connecting,
+        since it is not required for the core analysis flow."""
+
+        async def caller(name, arguments):
+            return {}
+
+        tools_without_save_document = TOOLS - {"save_document"}
+        adapter = DataHubMCPAdapter(caller, tools_without_save_document)
+        self.assertFalse(adapter.save_document_available)
+
+    def test_save_document_available_when_tool_present(self):
+        async def caller(name, arguments):
+            return {"success": True}
+
+        adapter = DataHubMCPAdapter(caller, TOOLS)
+        self.assertTrue(adapter.save_document_available)
+
+    def test_save_impact_report_fails_clearly_when_unavailable(self):
+        async def caller(name, arguments):
+            return {}
+
+        tools_without_save_document = TOOLS - {"save_document"}
+        adapter = DataHubMCPAdapter(caller, tools_without_save_document)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                adapter.save_impact_report("title", "content", [], confirmed=True)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

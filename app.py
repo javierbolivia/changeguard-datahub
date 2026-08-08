@@ -4,6 +4,7 @@ A Streamlit application that demonstrates the ChangeGuard autonomous agent
 evaluating schema change risk by tracing downstream lineage in DataHub.
 """
 
+import asyncio
 import time
 
 import streamlit as st
@@ -14,6 +15,7 @@ from contract_sentinel.agent import (
     ChangeGuardAgent,
     StepStatus,
 )
+from contract_sentinel.mcp_connection import create_live_adapter
 from contract_sentinel.risk import Change
 
 
@@ -116,6 +118,15 @@ with st.sidebar:
         value=False,
         help="If checked and in Live mode, saves the impact report to DataHub.",
     )
+
+    datahub_url = "http://localhost:8080"
+    datahub_token = ""
+    if mode == "Live (DataHub MCP)":
+        st.caption("Live mode connects to a real DataHub instance via MCP.")
+        datahub_url = st.text_input("DataHub GMS URL", value="http://localhost:8080")
+        datahub_token = st.text_input(
+            "DataHub Access Token (optional)", value="", type="password"
+        )
 
     st.divider()
     analyze = st.button(
@@ -262,9 +273,49 @@ def on_step_update(step: AgentStep) -> None:
 
 # Run the agent
 use_live = mode == "Live (DataHub MCP)"
-agent = ChangeGuardAgent(mcp_adapter=None, on_step_update=on_step_update)
 
-result = agent.run(change, confirm_writeback=confirm_wb)
+
+async def execute_agent() -> tuple[AgentResult | None, str | None]:
+    """Single async flow: build the adapter (if Live) and run the agent.
+
+    Returns (result, connection_error). If connection_error is set, the
+    agent was never run and no fixtures were substituted.
+    """
+    mcp_adapter = None
+    if use_live:
+        try:
+            mcp_adapter = await create_live_adapter(
+                datahub_url=datahub_url or "http://localhost:8080",
+                datahub_token=datahub_token or None,
+            )
+        except Exception as e:
+            return None, str(e)
+
+    try:
+        agent = ChangeGuardAgent(mcp_adapter=mcp_adapter, on_step_update=on_step_update)
+        result = await agent.run_async(change, confirm_writeback=confirm_wb)
+        return result, None
+    finally:
+        if mcp_adapter is not None:
+            try:
+                await mcp_adapter.close()
+            except Exception:
+                # Do not let a cleanup failure hide the agent's result or
+                # any error already being propagated from this block.
+                pass
+
+
+result, connection_error = asyncio.run(execute_agent())
+
+if connection_error:
+    st.error(
+        f"\u274c **Failed to connect to DataHub MCP server** at "
+        f"`{datahub_url}`.\n\n**Error:** {connection_error}\n\n"
+        f"Live mode requires a running DataHub instance and the "
+        f"`mcp-server-datahub` package reachable via `uvx`. This run was "
+        f"**not** completed and no demo data was substituted."
+    )
+    st.stop()
 
 # ─── Results ─────────────────────────────────────────────────────────────────
 

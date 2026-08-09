@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import deque
 from typing import Any
 
 from .datahub_mcp import DataHubMCPAdapter, ToolCaller
@@ -46,6 +47,11 @@ class MCPStdioClient:
         self._request_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=50)
+        self._reader_error: BaseException | None = None
+        self._closing = False
+        self._closed = False
         self._tools: set[str] = set()
 
     @classmethod
@@ -79,9 +85,22 @@ class MCPStdioClient:
 
         client = cls(process)
         client._reader_task = asyncio.create_task(client._read_responses())
+        client._stderr_task = asyncio.create_task(client._drain_stderr())
 
         # Initialize the connection
-        await client._initialize()
+        try:
+            await client._initialize()
+        except BaseException as initialize_error:
+            # ``create_live_adapter`` cannot close a client that connect()
+            # never returned. Clean up here so a failed handshake cannot
+            # leave uvx/mcp-server-datahub running in the background.
+            try:
+                await client.close()
+            except BaseException as close_error:
+                initialize_error.add_note(
+                    f"MCP cleanup after initialization failure also failed: {close_error}"
+                )
+            raise
         return client
 
     async def _initialize(self) -> None:
@@ -118,6 +137,13 @@ class MCPStdioClient:
 
     async def _send_request(self, method: str, params: dict) -> dict:
         """Send a JSON-RPC request and wait for the response."""
+        if self._closing or self._closed:
+            raise ConnectionError("MCP client is closing or already closed")
+        if self._reader_error is not None:
+            raise ConnectionError(
+                f"MCP response reader is unavailable: {self._reader_error}"
+            ) from self._reader_error
+
         self._request_id += 1
         request_id = self._request_id
 
@@ -128,20 +154,25 @@ class MCPStdioClient:
             "params": params,
         }
 
-        line = json.dumps(message) + "\n"
-        self._process.stdin.write(line.encode())
-        await self._process.stdin.drain()
-
-        # Wait for response
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        # Register the future before writing. The reader task runs
+        # concurrently, so a fast response must never arrive before its
+        # request ID exists in ``_pending``.
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
 
         try:
+            line = json.dumps(message) + "\n"
+            self._process.stdin.write(line.encode())
+            await self._process.stdin.drain()
+
             result = await asyncio.wait_for(future, timeout=30.0)
             return result
         except asyncio.TimeoutError:
-            self._pending.pop(request_id, None)
             raise TimeoutError(f"MCP request '{method}' timed out after 30s")
+        finally:
+            self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
 
     async def _read_responses(self) -> None:
         """Background task to read responses from the MCP server."""
@@ -149,7 +180,11 @@ class MCPStdioClient:
             while True:
                 line = await self._process.stdout.readline()
                 if not line:
-                    break
+                    if self._closing:
+                        break
+                    raise ConnectionError(
+                        "MCP server closed stdout before completing the connection"
+                    )
 
                 try:
                     message = json.loads(line.decode())
@@ -157,8 +192,10 @@ class MCPStdioClient:
                     continue
 
                 request_id = message.get("id")
-                if request_id and request_id in self._pending:
+                if request_id is not None and request_id in self._pending:
                     future = self._pending.pop(request_id)
+                    if future.done():
+                        continue
                     if "error" in message:
                         future.set_exception(
                             RuntimeError(
@@ -169,6 +206,35 @@ class MCPStdioClient:
                         future.set_result(message.get("result", {}))
         except asyncio.CancelledError:
             pass
+        except Exception as error:
+            self._reader_error = error
+            self._fail_pending(f"MCP response reader failed: {error}")
+
+    async def _drain_stderr(self) -> None:
+        """Continuously drain child stderr to prevent pipe backpressure.
+
+        The server is verbose even on successful read-only calls. Keep only
+        a small in-memory tail for diagnostics; stdout remains the JSON-RPC
+        protocol channel and user-facing CLI JSON stays untouched.
+        """
+        if self._process.stderr is None:
+            return
+        try:
+            while True:
+                line = await self._process.stderr.readline()
+                if not line:
+                    break
+                self._stderr_tail.append(line.decode(errors="replace").rstrip())
+        except asyncio.CancelledError:
+            pass
+
+    def _fail_pending(self, message: str) -> None:
+        """Fail every outstanding request immediately after transport death."""
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for future in pending:
+            if not future.done():
+                future.set_exception(ConnectionError(message))
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Call an MCP tool and return the result."""
@@ -203,11 +269,24 @@ class MCPStdioClient:
         the final ``wait()`` are bounded by a timeout with a ``kill()``
         fallback.
         """
-        if self._reader_task:
-            self._reader_task.cancel()
+        if self._closing or self._closed:
+            return
+        self._closing = True
+        self._fail_pending("MCP client closed while requests were pending")
+
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task)
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
             try:
-                await asyncio.wait_for(self._reader_task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=5.0
+                )
+            except asyncio.TimeoutError:
                 pass
 
         if self._process.stdin:
@@ -229,6 +308,7 @@ class MCPStdioClient:
                 await asyncio.wait_for(self._process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass  # Give up waiting; the process was at least signalled.
+        self._closed = True
 
 
 async def create_live_adapter(

@@ -19,7 +19,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertIsInstance(result, AgentResult)
         self.assertEqual(result.mode, "demo")
-        self.assertEqual(len(result.steps), 10)
+        self.assertEqual(len(result.steps), 11)
         self.assertIsNotNone(result.impact)
         self.assertIsNotNone(result.report)
         self.assertEqual(result.impact.severity, "critical")
@@ -30,8 +30,8 @@ class AgentTests(unittest.TestCase):
         agent = ChangeGuardAgent(on_step_update=lambda s: events.append(s.status))
         agent.run(Change("commerce.orders", "customer_id", "drop"))
 
-        # Each step emits RUNNING + final status = at least 20 events (10 steps)
-        self.assertGreaterEqual(len(events), 20)
+        # Each step emits RUNNING + final status = at least 22 events (11 steps)
+        self.assertGreaterEqual(len(events), 22)
         # All steps complete (SUCCESS or SKIPPED)
         final_statuses = [events[i] for i in range(1, len(events), 2)]
         for status in final_statuses:
@@ -599,6 +599,239 @@ class LiveModeShapeTests(unittest.TestCase):
         self.assertIn("unreachable", wb_step.error)
         # The rest of the pipeline (score/decision) must be unaffected.
         self.assertIsNotNone(result.impact)
+
+    def test_previous_context_parsed_and_does_not_affect_score(self):
+        """When get_entities returns real changeguard_* custom properties
+        from a prior run, the agent must surface them as previous_context
+        without letting them influence the current score/decision."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return [
+                    {
+                        "properties": {
+                            "customProperties": [
+                                {"key": "changeguard_decision", "value": "BLOCK"},
+                                {"key": "changeguard_risk_score", "value": "60"},
+                                {"key": "changeguard_severity", "value": "high"},
+                                {"key": "changeguard_operation", "value": "drop"},
+                                {"key": "changeguard_column", "value": "customer_id"},
+                                {"key": "changeguard_timestamp", "value": "2026-08-09T02:40:44+00:00"},
+                            ]
+                        }
+                    }
+                ]
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        # Different operation from the persisted one (drop) - rename here.
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        self.assertIsNotNone(result.previous_context)
+        self.assertEqual(result.previous_context.decision, "BLOCK")
+        self.assertEqual(result.previous_context.risk_score, 60)
+        self.assertEqual(result.previous_context.operation, "drop")
+
+        # The CURRENT analysis must be unaffected by the persisted BLOCK:
+        # a rename with no downstream assets in this scenario is a fresh,
+        # independently computed score, not a copy of the old one.
+        self.assertNotEqual(result.impact.score, 60)
+        context_step = next(s for s in result.steps if s.name == "fetch_previous_context")
+        self.assertEqual(context_step.status, StepStatus.SUCCESS)
+
+    def test_no_persisted_properties_yields_none_context_not_error(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return [{"properties": {"customProperties": []}}]
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        self.assertIsNone(result.previous_context)
+        self.assertFalse(result.previously_evaluated)
+        context_step = next(s for s in result.steps if s.name == "fetch_previous_context")
+        self.assertEqual(context_step.status, StepStatus.SUCCESS)
+        # No previous context must not prevent a normal decision.
+        self.assertIsNotNone(result.impact)
+
+    def test_matching_dataset_column_operation_marks_previously_evaluated(self):
+        """Same dataset (implicit - only one dataset is evaluated per
+        run), column, and operation as the persisted context must set
+        previously_evaluated=True, without skipping the real analysis."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return [
+                    {
+                        "properties": {
+                            "customProperties": [
+                                {"key": "changeguard_decision", "value": "BLOCK"},
+                                {"key": "changeguard_risk_score", "value": "60"},
+                                {"key": "changeguard_severity", "value": "high"},
+                                {"key": "changeguard_operation", "value": "drop"},
+                                {"key": "changeguard_column", "value": "customer_id"},
+                                {"key": "changeguard_timestamp", "value": "2026-08-09T02:40:44+00:00"},
+                            ]
+                        }
+                    }
+                ]
+            if name == "get_lineage":
+                return {
+                    "downstreams": {
+                        "searchResults": [
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                    "name": "analytics.customer_orders",
+                                },
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        # Same column + operation (drop / customer_id) as the persisted context.
+        result = agent.run(Change("commerce.orders", "customer_id", "drop"))
+
+        self.assertTrue(result.previously_evaluated)
+        # The pipeline still ran validate_schema and fetch_lineage - it
+        # was not skipped because a previous decision existed.
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        lineage_step = next(s for s in result.steps if s.name == "fetch_lineage")
+        self.assertEqual(validate_step.status, StepStatus.SUCCESS)
+        self.assertEqual(lineage_step.status, StepStatus.SUCCESS)
+        # Real, freshly computed decision, matching the documented scenario.
+        self.assertEqual(result.impact.score, 60)
+        self.assertEqual(result.impact.severity, "high")
+
+    def test_get_entities_failure_does_not_break_pipeline(self):
+        """fetch_previous_context is best-effort: a get_entities failure
+        must degrade to previous_context=None and still let schema
+        validation, lineage, and the decision complete normally."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                raise ConnectionError("DataHub GMS unreachable")
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        context_step = next(s for s in result.steps if s.name == "fetch_previous_context")
+        self.assertEqual(context_step.status, StepStatus.FAILED)
+        self.assertIsNone(result.previous_context)
+        self.assertFalse(result.previously_evaluated)
+
+        # The rest of the pipeline must complete normally.
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.SUCCESS)
+        self.assertIsNotNone(result.impact)
+        decision_step = next(s for s in result.steps if s.name == "decision")
+        self.assertEqual(decision_step.status, StepStatus.SUCCESS)
+
+    def test_full_report_includes_previous_context_section_when_present(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return [
+                    {
+                        "properties": {
+                            "customProperties": [
+                                {"key": "changeguard_decision", "value": "BLOCK"},
+                                {"key": "changeguard_risk_score", "value": "60"},
+                                {"key": "changeguard_severity", "value": "high"},
+                                {"key": "changeguard_operation", "value": "drop"},
+                                {"key": "changeguard_column", "value": "customer_id"},
+                                {"key": "changeguard_timestamp", "value": "2026-08-09T02:40:44+00:00"},
+                            ]
+                        }
+                    }
+                ]
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        self.assertIn("Previous ChangeGuard Context", result.report)
+        self.assertIn("BLOCK", result.report)
+        self.assertIn("customer_id", result.report)
+
+    def test_full_report_notes_absence_when_no_previous_context(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return [{"properties": {"customProperties": []}}]
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        self.assertIn("Previous ChangeGuard Context", result.report)
+        self.assertIn("No previously persisted ChangeGuard decision", result.report)
 
     def test_demo_mode_skips_schema_validation(self):
         """Demo mode has no live schema to check against and must keep

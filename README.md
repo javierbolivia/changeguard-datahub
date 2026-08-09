@@ -30,12 +30,14 @@ Schema changes (renaming a column, dropping a field, changing a type) routinely 
 │                                                              │
 │  Step 1 → Parse & validate change                            │
 │  Step 2 → Resolve dataset URN in DataHub (search)            │
-│  Step 3 → Fetch column-level downstream lineage (get_lineage)│
-│  Step 4 → Score risk (transparent rules, no LLM)             │
-│  Step 5 → Generate impact report with migration checklist    │
-│  Step 6 → Write report back to DataHub (save_document, opt.) │
-│  Step 7 → BLOCK or ALLOW deployment decision                 │
-│  Step 8 → Persist decision to DataHub (custom properties)    │
+│  Step 3 → Read DataHub Memory: last persisted decision       │
+│           (get_entities, best-effort, informational only)    │
+│  Step 4 → Fetch column-level downstream lineage (get_lineage)│
+│  Step 5 → Score risk (transparent rules, no LLM)             │
+│  Step 6 → Generate impact report with migration checklist    │
+│  Step 7 → Write report back to DataHub (save_document, opt.) │
+│  Step 8 → BLOCK or ALLOW deployment decision                 │
+│  Step 9 → Persist decision to DataHub (custom properties)    │
 │                                                              │
 └──────────────────────────┬──────────────────────────────────┘
                            │  MCP stdio (uvx mcp-server-datahub) for
@@ -125,16 +127,23 @@ with a clear error (`contract_sentinel/datahub_mcp.py`, `REQUIRED_TOOLS`):
 |---|---|---|
 | `search` | **Yes**, every Live run | Find the dataset by name → resolve URN |
 | `get_lineage` | **Yes**, every Live run | Column-level downstream traversal |
-| `get_entities` | Required for connection, not currently called by the agent | Reserved for future asset/ownership lookups |
-| `list_schema_fields` | Required for connection, not currently called by the agent | Reserved for future schema inspection |
+| `list_schema_fields` | **Yes**, every Live run | Verify the dataset and column exist before scoring |
+| `get_entities` | **Yes**, every Live run | Read persisted ChangeGuard context and entity metadata available through MCP (see [DataHub Memory](#datahub-memory) below) |
 | `get_lineage_paths_between` | Required for connection, not currently called by the agent | Reserved for future multi-hop path tracing |
 | `save_document` | Only if "Write report back to DataHub" is checked and available | Write the Markdown impact report as a document |
 
-Today, `search` and `get_lineage` are what the agent actually calls to
-produce a decision. `get_entities`, `list_schema_fields`, and
-`get_lineage_paths_between` are required at connection time (so an
-incompatible MCP server is rejected early) but are not yet invoked in the
-pipeline — this is accurately reflected as a gap, not a used feature.
+Today, `search`, `get_lineage`, `list_schema_fields`, and `get_entities`
+are what the agent actually calls to produce a decision and surface
+context. `get_lineage_paths_between` is required at connection time (so
+an incompatible MCP server is rejected early) but is not yet invoked in
+the pipeline — this is accurately reflected as a gap, not a used feature.
+
+As observed against a real `mcp-server-datahub` server, `get_entities`'s
+response does not include `ownership`, `domain`, or `tags` today — only
+`platform`, `properties` (including `customProperties`), `health`,
+`schemaMetadata`, and `relatedDocuments`. ChangeGuard therefore uses it
+specifically to read back `customProperties`, not for ownership/domain/tag
+enrichment (see [DataHub Memory](#datahub-memory)).
 
 `save_document` is a Document Tool, not a Mutation Tool, and `mcp-server-datahub` automatically hides it when the DataHub instance has no documents yet in its catalog. ChangeGuard treats it as optional: Live mode connects and runs the full search → lineage → risk → decision flow even when `save_document` is unavailable. If it is unavailable, the "Write report back to DataHub" step is skipped with a clear reason, instead of silently failing or blocking the connection.
 
@@ -287,6 +296,37 @@ the `changeguard_*` custom properties will be listed there.
 
 ---
 
+## DataHub Memory
+
+ChangeGuard also reads back the `changeguard_*` custom properties it
+writes (see [DataHub Writeback](#datahub-writeback) above), via the MCP
+`get_entities` tool, and surfaces them as **the last ChangeGuard decision
+persisted in DataHub** for the dataset being evaluated.
+
+This is explicitly **not** a history or audit trail: custom properties
+are overwritten on every writeback, so only the single most recent
+decision is ever available this way. It is implemented in
+[`contract_sentinel/datahub_writeback.py`](contract_sentinel/datahub_writeback.py)
+(`parse_persisted_context`) and read in
+[`contract_sentinel/agent.py`](contract_sentinel/agent.py) as a
+best-effort step (`fetch_previous_context`).
+
+**Behavior:**
+- If a dataset has no `changeguard_*` properties yet, `previous_context`
+  is `None` and the report simply notes no previous decision was found —
+  this is not an error.
+- If the current dataset/column/operation match the persisted context
+  exactly, the Streamlit UI shows a **"Previously evaluated in
+  DataHub"** badge — but the agent always re-runs the full analysis
+  (schema validation, lineage, scoring) regardless. The previous
+  decision is context for the operator, never a shortcut and never an
+  input to the current score.
+- If `get_entities` fails or DataHub is briefly unreachable, this step is
+  marked `FAILED` but does not block schema validation, lineage, or the
+  ALLOW/BLOCK decision — DataHub Memory is best-effort by design.
+
+---
+
 ## CI/CD Gate
 
 ChangeGuard exposes a CI-compatible exit code through `contract_sentinel/cli.py`, so a schema change can be gated in a pipeline without going through the Streamlit UI. It reuses the exact same `ChangeGuardAgent` and DataHub MCP integration as the UI — no separate scoring logic.
@@ -405,7 +445,8 @@ See the full output: [`examples/changeguard-impact-report.md`](examples/changegu
 - The public Streamlit Cloud deployment only supports Demo mode (see above) — it cannot reach a DataHub instance on your local machine.
 - Live mode's `resolve_urn` step falls back to a constructed URN (naming-convention guess) only if `search` returns zero results while otherwise succeeding; a hard connection or tool-call failure never falls back to any guess or fixture data, it surfaces the real error and stops.
 - `save_document` writeback depends on the target DataHub instance already having at least one document in its catalog, or being configured to expose the tool regardless; ChangeGuard detects this at connect time and skips that step with a clear reason rather than failing.
-- The agent requires `get_entities`, `list_schema_fields`, and `get_lineage_paths_between` to be advertised by the MCP server to connect, but does not currently call them — see [DataHub MCP Integration](#datahub-mcp-integration).
+- The agent requires `get_lineage_paths_between` to be advertised by the MCP server to connect, but does not currently call it — see [DataHub MCP Integration](#datahub-mcp-integration).
+- `get_entities` does not return `ownership`, `domain`, or `tags` in the current `mcp-server-datahub` response shape, and our seeded local DataHub instance has none of these set on any dataset either (confirmed directly via DataHub's GraphQL API during investigation). ChangeGuard therefore does not display ownership/domain/tags for Live-mode assets — see [DataHub Memory](#datahub-memory) for what `get_entities` is used for instead.
 - Ownership, criticality, and dashboard classification of downstream assets in Live mode are not yet sourced from DataHub — `critical` is always `false` and `owner` is always `"Unknown"` for Live-mode results, since the agent does not call the tools that would supply that data. This means the risk score's "critical asset" and "business dashboard" bonus factors never trigger in Live mode today (they only apply in Demo mode, where fixtures set `critical: true` on some assets).
 - The CI/CD gate (`contract_sentinel/cli.py`, see [CI/CD Gate](#cicd-gate) below) never writes back to DataHub — it always runs with `confirm_writeback=False`, so it is safe to run unattended, but it cannot be used to persist a decision the way the Streamlit UI can.
 - The decision-persistence writeback (custom properties) has been verified against a local DataHub OSS quickstart instance only, not against DataHub Cloud or a production deployment.

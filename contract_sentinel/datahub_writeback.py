@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from datahub.emitter.mce_builder import make_dataset_urn
 from datahub.emitter.rest_emitter import DatahubRestEmitter
@@ -63,6 +64,98 @@ def build_writeback_properties(
         "changeguard_column": column,
         "changeguard_timestamp": ts,
     }
+
+
+@dataclass(frozen=True)
+class PersistedContext:
+    """The last ChangeGuard decision read back from DataHub, if any.
+
+    This is DataHub Memory / the last persisted ChangeGuard decision for a
+    dataset — not a history or audit trail. ``changeguard_*`` custom
+    properties are overwritten on every writeback (see
+    ``build_writeback_properties`` above), so only the most recent
+    decision is ever available this way.
+    """
+
+    decision: str
+    risk_score: int | None
+    severity: str
+    operation: str
+    column: str
+    timestamp: str
+
+
+def parse_persisted_context(get_entities_response: Any) -> PersistedContext | None:
+    """Parse the ChangeGuard ``changeguard_*`` custom properties out of a
+    real ``get_entities`` MCP response, as observed against a live
+    ``mcp-server-datahub`` server::
+
+        [
+          {
+            "urn": "...",
+            "properties": {
+              "customProperties": [
+                {"key": "changeguard_decision", "value": "BLOCK"},
+                {"key": "changeguard_risk_score", "value": "60"},
+                ...
+              ]
+            },
+            ...
+          }
+        ]
+
+    Returns ``None`` if the response has no entity, no ``properties``, no
+    ``customProperties``, or none of the expected ``changeguard_*`` keys —
+    all of these mean "no previously persisted ChangeGuard decision for
+    this dataset", which is an expected, non-error outcome, not something
+    to raise on.
+
+    This is a pure function so it is trivially testable without a live
+    DataHub connection, mirroring ``build_writeback_properties`` above.
+    """
+    if not isinstance(get_entities_response, list) or not get_entities_response:
+        return None
+
+    entity = get_entities_response[0]
+    if not isinstance(entity, dict):
+        return None
+
+    raw_props = (
+        entity.get("properties", {}).get("customProperties", [])
+        if isinstance(entity.get("properties"), dict)
+        else []
+    )
+    if not isinstance(raw_props, list):
+        return None
+
+    props: dict[str, str] = {}
+    for item in raw_props:
+        if isinstance(item, dict) and "key" in item and "value" in item:
+            props[item["key"]] = item["value"]
+
+    decision = props.get("changeguard_decision")
+    if not decision:
+        # No ChangeGuard properties on this dataset at all - nothing was
+        # ever persisted, not a malformed response.
+        return None
+
+    raw_score = props.get("changeguard_risk_score")
+    try:
+        risk_score = int(raw_score) if raw_score is not None else None
+    except (TypeError, ValueError):
+        # An unparseable score must not crash context reading - the rest
+        # of the persisted context (decision, severity, etc.) is still
+        # useful even if the score field is malformed.
+        risk_score = None
+
+    return PersistedContext(
+        decision=decision,
+        risk_score=risk_score,
+        severity=props.get("changeguard_severity", "Unknown"),
+        operation=props.get("changeguard_operation", "Unknown"),
+        column=props.get("changeguard_column", "Unknown"),
+        timestamp=props.get("changeguard_timestamp", "Unknown"),
+    )
 
 
 def write_decision_to_datahub(

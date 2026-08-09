@@ -94,6 +94,27 @@ class DataHubMCPAdapter:
             },
         )
 
+    async def get_persisted_context(self, urn: str) -> Any:
+        """Read entity metadata for ``urn`` via ``get_entities``.
+
+        This is how ChangeGuard reads back its own previously persisted
+        decision: ``get_entities`` returns (among other fields) the
+        dataset's ``properties.customProperties``, which is exactly what
+        ``datahub_writeback.write_decision_to_datahub`` writes onto the
+        dataset (``changeguard_decision``, ``changeguard_risk_score``,
+        etc.) via the DataHub SDK.
+
+        Note: as observed against the real ``mcp-server-datahub`` server,
+        ``get_entities`` does not include ``ownership``, ``domain``, or
+        ``tags`` in its response shape today — only ``platform``,
+        ``properties`` (incl. ``customProperties``), ``health``,
+        ``schemaMetadata``, and ``relatedDocuments``. This method is
+        therefore scoped to reading persisted ChangeGuard context and the
+        entity metadata ``get_entities`` actually provides, not to
+        ownership/domain/tags enrichment.
+        """
+        return await self._call_tool("get_entities", {"urns": [urn]})
+
     async def save_impact_report(
         self, title: str, content: str, related_assets: list[str], confirmed: bool
     ) -> dict[str, Any]:

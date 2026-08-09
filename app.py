@@ -222,6 +222,7 @@ The agent uses these DataHub MCP Server tools:
 - `search` — find the dataset by name
 - `get_lineage` — column-level downstream traversal
 - `list_schema_fields` — verify the dataset and column exist before scoring
+- `get_entities` — read persisted ChangeGuard context and entity metadata available through MCP
 - `save_document` — optionally write the impact report back to DataHub
 """
         )
@@ -276,6 +277,7 @@ STEP_NAMES = {
     "parse_change": "Parse & Validate Change",
     "resolve_urn": "Resolve Dataset in DataHub",
     "validate_schema": "Validate Column Against Schema",
+    "fetch_previous_context": "Read DataHub Memory (Previous Decision)",
     "fetch_lineage": "Fetch Downstream Lineage",
     "fetch_potential_downstream": "Fetch Potential Downstream Propagation",
     "assess_risk": "Calculate Risk Score",
@@ -305,9 +307,9 @@ def render_step(step: AgentStep, placeholder) -> None:
         placeholder.markdown(f"{icon} **{label}** — Pending")
 
 
-# Pre-create 10 placeholders
+# Pre-create 11 placeholders
 with step_container:
-    for _ in range(10):
+    for _ in range(11):
         steps_placeholders.append(st.empty())
 
 # Track step index
@@ -413,6 +415,24 @@ if result.impact:
             f"and checklist below before deploying."
         )
 
+    # ─── DataHub Memory: last persisted ChangeGuard decision ────────────
+    # This is context read back from DataHub via get_entities, not a
+    # history or audit trail — custom properties are overwritten on every
+    # writeback, so only the single most recent decision is available.
+    if result.previous_context is not None:
+        pc = result.previous_context
+        if result.previously_evaluated:
+            st.info("\U0001f501 **Previously evaluated in DataHub** — same dataset, column, and operation.")
+        with st.expander("\U0001f9e0 DataHub Memory — Last Persisted ChangeGuard Decision", expanded=True):
+            st.caption("This is the last ChangeGuard decision persisted in DataHub for this dataset.")
+            score_display = pc.risk_score if pc.risk_score is not None else "Unknown"
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Decision", pc.decision)
+            m2.metric("Risk", f"{score_display} / {pc.severity.upper()}")
+            m3.metric("Operation", pc.operation)
+            m4.metric("Column", pc.column)
+            st.caption(f"Evaluated: {pc.timestamp}")
+
     # Detailed sections in tabs
     tab_reasons, tab_blast, tab_checklist, tab_report = st.tabs(
         ["\U0001f50d Why Flagged", "\U0001f4a5 Blast Radius", "\u2705 Checklist", "\U0001f4c4 Full Report"]
@@ -477,7 +497,7 @@ if result.impact:
     with st.expander("\u23f1\ufe0f Execution Summary"):
         total_ms = sum(s.duration_ms for s in result.steps)
         st.write(f"**Total execution time:** {total_ms:.0f}ms")
-        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/10")
+        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/11")
         st.write(f"**Data source:** {result.mode}")
         for step in result.steps:
             icon = STEP_ICONS.get(step.status, "?")

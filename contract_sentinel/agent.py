@@ -3,10 +3,12 @@
 This module implements a step-by-step agent that:
 1. Receives a proposed schema change
 2. Resolves the dataset URN in DataHub
-3. Fetches column-level downstream lineage
-4. Scores risk using transparent rules
-5. Generates a human-readable impact report
-6. Optionally writes the report back to DataHub (with explicit confirmation)
+3. Reads back any previously persisted ChangeGuard decision for context
+   (DataHub Memory — informational only, never affects scoring)
+4. Fetches column-level downstream lineage
+5. Scores risk using transparent rules
+6. Generates a human-readable impact report
+7. Optionally writes the report back to DataHub (with explicit confirmation)
 
 Each step emits structured events so the UI can show the agent's thinking
 process in real-time.
@@ -21,6 +23,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from .datahub_mcp import DataHubMCPAdapter, ToolCaller
+from .datahub_writeback import PersistedContext, parse_persisted_context
 from .fixtures import SHOWCASE_ASSETS
 from .report import render_markdown
 from .risk import Change, Impact, assess_change
@@ -64,6 +67,15 @@ class AgentResult:
     potential_downstream_assets: list[dict] = field(default_factory=list)
     writeback_success: bool = False
     mode: str = "demo"  # "demo" or "live"
+    # DataHub Memory: the last ChangeGuard decision persisted on this
+    # dataset, read back via get_entities. None if there is no previously
+    # persisted decision, or if reading it failed (best-effort only - see
+    # Step 2c in run_async). This is context for the operator, not an
+    # input to scoring: it never changes impact/decision below.
+    previous_context: PersistedContext | None = None
+    # True only when previous_context exists AND its dataset/column/
+    # operation exactly match the change being evaluated right now.
+    previously_evaluated: bool = False
 
 
 # Type for the callback that receives step updates in real-time
@@ -258,6 +270,54 @@ class ChangeGuardAgent:
             step2b.duration_ms = (time.perf_counter() - t0) * 1000
         self._emit(step2b)
 
+        # Step 2c: DataHub Memory — best-effort read of the last
+        # ChangeGuard decision persisted on this dataset (via
+        # get_entities' customProperties). This is context for the
+        # operator only: it is never used as the source of truth for the
+        # current decision, never skips lineage/validation, and a failure
+        # here must not block the rest of the pipeline.
+        step2c = AgentStep(
+            name="fetch_previous_context",
+            description="Reading previously persisted ChangeGuard decision (DataHub Memory)",
+        )
+        result.steps.append(step2c)
+        step2c.status = StepStatus.RUNNING
+        self._emit(step2c)
+        t0 = time.perf_counter()
+
+        if self._mcp and dataset_urn:
+            try:
+                entities_response = await self._mcp.get_persisted_context(dataset_urn)
+                previous = parse_persisted_context(entities_response)
+                result.previous_context = previous
+                if previous is not None:
+                    result.previously_evaluated = (
+                        previous.operation == change.operation
+                        and previous.column == change.column
+                    )
+                    step2c.result = {
+                        "found": True,
+                        "decision": previous.decision,
+                        "previously_evaluated": result.previously_evaluated,
+                    }
+                else:
+                    step2c.result = {"found": False}
+                step2c.status = StepStatus.SUCCESS
+                step2c.duration_ms = (time.perf_counter() - t0) * 1000
+            except Exception as e:
+                # Best-effort only: DataHub Memory is context, not a
+                # requirement. A failure here must never break schema
+                # validation, lineage, or the ALLOW/BLOCK decision.
+                step2c.status = StepStatus.FAILED
+                step2c.error = str(e)
+                step2c.duration_ms = (time.perf_counter() - t0) * 1000
+                result.previous_context = None
+        else:
+            step2c.status = StepStatus.SKIPPED
+            step2c.result = {"reason": "Demo mode — no live DataHub Memory to read"}
+            step2c.duration_ms = (time.perf_counter() - t0) * 1000
+        self._emit(step2c)
+
         # Step 3: Fetch downstream column-level lineage
         step3 = AgentStep(
             name="fetch_lineage",
@@ -430,7 +490,11 @@ class ChangeGuardAgent:
 
         try:
             report = render_markdown(
-                change, impact, downstream, result.potential_downstream_assets
+                change,
+                impact,
+                downstream,
+                result.potential_downstream_assets,
+                result.previous_context,
             )
             result.report = report
             step5.result = {"report_length": len(report), "has_checklist": True}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .datahub_writeback import PersistedContext
 from .risk import Change, Impact
 
 
@@ -10,6 +11,7 @@ def render_markdown(
     impact: Impact,
     assets: list[dict],
     potential_assets: list[dict] | None = None,
+    previous_context: PersistedContext | None = None,
 ) -> str:
     potential_assets = potential_assets or []
     lines = [
@@ -55,5 +57,27 @@ def render_markdown(
             "- [ ] Review potential downstream datasets where column-level "
             "lineage is incomplete."
         )
+
+    if previous_context is not None:
+        lines.extend(["", "## Previous ChangeGuard Context"])
+        lines.append(
+            "This is the last ChangeGuard decision persisted in DataHub "
+            "for this dataset — not a history or audit trail; it reflects "
+            "only the most recent writeback."
+        )
+        score_display = (
+            previous_context.risk_score
+            if previous_context.risk_score is not None
+            else "Unknown"
+        )
+        lines.append(f"- Decision: {previous_context.decision}")
+        lines.append(f"- Risk: {score_display} / {previous_context.severity}")
+        lines.append(f"- Operation: {previous_context.operation}")
+        lines.append(f"- Column: {previous_context.column}")
+        lines.append(f"- Evaluated: {previous_context.timestamp}")
+    else:
+        lines.extend(["", "## Previous ChangeGuard Context"])
+        lines.append("No previously persisted ChangeGuard decision found for this dataset.")
+
     return "\n".join(lines)
 

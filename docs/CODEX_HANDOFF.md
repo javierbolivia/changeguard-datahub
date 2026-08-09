@@ -1,287 +1,287 @@
 # ChangeGuard — Codex Handoff
 
-This document describes the real, current state of the ChangeGuard
-project as of commit `c36b321` on `main`, so a new agent can continue
-work without reading prior chat history. See `AGENTS.md` in the repo root
-for the permanent development rules — this document is context, not
-rules.
+This document records the verified state of ChangeGuard immediately before the
+final documentation commit. Permanent development constraints remain in
+`AGENTS.md`; this handoff provides current implementation and submission
+context.
 
-## 1. Product
+## Stable baseline
 
-ChangeGuard is a pre-deployment schema/data-contract safety agent built
-on DataHub. It evaluates a proposed schema change and produces a
-deterministic ALLOW/BLOCK decision before the change ships.
+- Branch: `main`
+- Stable HEAD before the documentation commit:
+  `fddbd2686483dcca792a18737f720191193f4712`
+- Test suite: **85/85 passing**
+- Product position: **pre-deployment schema change gate**
+- Implementation status: controlled hackathon implementation, not a
+  production-hardened deployment
 
-Current pipeline (`ChangeGuardAgent.run_async`, `contract_sentinel/agent.py`):
+## Product summary
 
-1. Parse & validate the proposed change (`parse_change`)
-2. Resolve the dataset URN in DataHub (`resolve_urn`, via `search`)
-3. Validate the column exists in the real schema (`validate_schema`, via
-   `list_schema_fields`; Live mode only)
-4. Read DataHub Memory — the last persisted ChangeGuard decision for this
-   dataset, if any (`fetch_previous_context`, via `get_entities`;
-   best-effort, informational only)
-5. Fetch confirmed column-level downstream lineage
-   (`fetch_lineage`, via `get_lineage` with a `column` filter)
-6. Fetch potential table-level downstream propagation
-   (`fetch_potential_downstream`, via `get_lineage` without a `column`
-   filter; informational only, never scored)
-7. Calculate risk score (`assess_risk`, via `contract_sentinel/risk.py`)
-8. Generate the Markdown impact report (`generate_report`)
-9. Optionally write the report back to DataHub (`writeback`, via the
-   optional `save_document` MCP tool)
-10. Render the final ALLOW/BLOCK decision (`decision`)
-11. Optionally persist the decision as DataHub custom properties
-    (`persist_decision`, via the DataHub SDK directly, not MCP)
+ChangeGuard is a deterministic agentic workflow that evaluates a proposed
+schema change before deployment. It validates the source schema, reads DataHub
+lineage evidence, distinguishes confirmed column impact from potential table
+propagation, and applies transparent policy rules to produce an ALLOW/BLOCK
+decision. It also produces deterministic remediation recommendations and can,
+with explicit user confirmation, persist the latest decision or a full report
+back to DataHub.
 
-Both writeback steps (9 and 11) only run if `confirm_writeback=True` is
-passed to `run_async`/`run`.
+Primary pitch:
 
-## 2. Real DataHub environment
+> ChangeGuard turns DataHub lineage into a pre-deployment ALLOW/BLOCK gate, with evidence-aware blast radius and remediation before schemas break production.
 
-- DataHub frontend: `http://localhost:9002`
-- DataHub GMS: `http://localhost:8080`
-- Main dataset: `commerce.orders` (platform: `snowflake`, env: `PROD`)
-  - Columns: `order_id`, `customer_id`, `amount`
-- Real table-level lineage (as seeded and observed via the DataHub UI and
-  MCP `get_lineage`):
-  `commerce.orders` → `analytics.customer_orders` → `analytics.sales_summary`
-- Real confirmed column-level lineage: only
-  `commerce.orders.customer_id` → `analytics.customer_orders.customer_id`
-- `analytics.sales_summary` is currently POTENTIAL, not confirmed,
-  because DataHub has no explicit column-level lineage edge reaching it
-  — only the table-level edge from `analytics.customer_orders`.
-- Ownership, Domain, and Tags are **not set** on any of these three
-  seeded datasets today (confirmed directly in the DataHub UI and via
-  DataHub's GraphQL API during investigation, independent of MCP).
+The decision path does not use an LLM. Remediation does not modify the score or
+guarantee that a change is safe; it is a recommended path to re-evaluation.
 
-## 3. Verified scenarios
+## Current feature set
 
-RENAME `commerce.orders.customer_id` → `cust_key` (Live mode):
-- 50/100, MEDIUM, ALLOW
-- Confirmed affected assets: 1 (`analytics.customer_orders`)
-- Potential downstream assets: 1 (`analytics.sales_summary`)
+- Source and rename-target schema validation
+- DataHub Memory for the latest persisted ChangeGuard decision
+- Confirmed column-level and potential table-level lineage views
+- Centralized deterministic risk scoring
+- ALLOW/BLOCK gate decisions
+- Deterministic, operation-specific remediation recommendations
+- CLI/CI exit-code contract and valid JSON output
+- Warning/degraded presentation for best-effort metadata failures
+- Hardened MCP stdio transport and subprocess lifecycle
+- Optional report and decision writeback with explicit user confirmation
 
-DROP `commerce.orders.customer_id` (Live mode):
-- 60/100, HIGH, BLOCK
-- Confirmed affected assets: 1 (`analytics.customer_orders`)
-- Potential downstream assets: 1 (`analytics.sales_summary`)
+These are current capabilities. Anything in [Future work](#future-work) is not
+implemented.
 
-Both were re-verified end-to-end against the real local DataHub instance
-before this handoff, including two consecutive Live runs in the same
-Streamlit session and via the CLI.
+## Eleven-step pipeline
 
-## 4. CLI / CI
+`ChangeGuardAgent` in `contract_sentinel/agent.py` is the central engine and the
+only caller of `assess_change`:
 
-`contract_sentinel/cli.py` (run as `python -m contract_sentinel.cli`):
+1. Parse and validate the proposed change (`parse_change`).
+2. Resolve the dataset URN with MCP `search` (`resolve_urn`).
+3. Validate source and target schema with `list_schema_fields`
+   (`validate_schema`).
+4. Read the latest persisted context with `get_entities`
+   (`fetch_previous_context`, best-effort).
+5. Fetch confirmed column-level lineage with column-filtered `get_lineage`
+   (`fetch_lineage`).
+6. Fetch potential table-level propagation with unfiltered `get_lineage`
+   (`fetch_potential_downstream`, best-effort and unscored).
+7. Calculate risk through `contract_sentinel/risk.py` (`assess_risk`).
+8. Generate the Markdown report (`generate_report`).
+9. Optionally write the report with MCP `save_document` (`writeback`).
+10. Produce the ALLOW/BLOCK decision (`decision`).
+11. Optionally persist the latest decision through the DataHub SDK
+    (`persist_decision`).
 
-```
-python -m contract_sentinel.cli \
-  --dataset commerce.orders --column customer_id \
-  --operation drop --mode live \
-  --datahub-url http://localhost:8080 --json
-```
+Best-effort failures are surfaced as warnings/degraded analysis rather than
+being presented as successful evidence. Live failures are never replaced with
+Demo fixtures.
 
-Arguments: `--dataset`, `--column`, `--operation`
-(`rename|drop|type_change|add`), `--new-name` (required for `rename`),
-`--mode` (`demo|live`, default `demo`), `--datahub-url` (default
-`http://localhost:8080`), `--datahub-token` (optional), `--json`.
+## DataHub integration
 
-Exit codes: `0` = ALLOW, `1` = BLOCK, `2` = execution/configuration error
-(dataset not found, column not found, DataHub/MCP unreachable, invalid
-arguments, e.g. `rename` without `--new-name`).
+### MCP reads and optional report write
 
-`--json` prints exactly one JSON object to stdout (no diagnostics mixed
-in), even on error — errors emit `{"error": ..., "dataset": ..., ...}` to
-stdout in `--json` mode, or `ChangeGuard error: ...` to stderr otherwise.
+| Tool | Current use |
+|---|---|
+| `search` | Resolve the requested dataset. |
+| `list_schema_fields` | Validate the source column and a rename target. |
+| `get_entities` | Read the latest persisted ChangeGuard Custom Properties. |
+| `get_lineage` with `column` | Fetch confirmed column-level downstream evidence. |
+| `get_lineage` without `column` | Fetch potential table-level propagation. |
+| `save_document` | Optionally write the full Markdown report when advertised and explicitly confirmed. |
 
-The CLI reuses `ChangeGuardAgent` and `create_live_adapter` directly (see
-`contract_sentinel/cli.py`'s `_run()`) — it has no parallel risk engine.
-It always calls `run_async(..., confirm_writeback=False)`, so it never
-writes to DataHub and is safe to run unattended.
+`get_lineage_paths_between` is required by the adapter's connection contract
+but is not called by the current pipeline. Do not present it as an active
+feature.
 
-A conceptual GitHub Actions example exists at
-`examples/github-actions-gate.yml`. It is illustrative only — it is not
-wired into this repository's own Actions.
+### SDK decision persistence
 
-## 5. DataHub writeback
+The separate `persist_decision` step uses the official `acryl-datahub` Python
+SDK, not MCP `save_document`. It writes six Custom Properties:
 
-"Persist Decision to DataHub" (`persist_decision` step,
-`contract_sentinel/datahub_writeback.py`, `write_decision_to_datahub`)
-writes six `changeguard_*` custom properties onto the analyzed dataset
-using the official `acryl-datahub` SDK's REST emitter +
-`DatasetPatchBuilder`, directly against the GMS REST API (not through
-MCP). The patch is additive (existing properties/description survive).
+- `changeguard_decision`
+- `changeguard_risk_score`
+- `changeguard_severity`
+- `changeguard_operation`
+- `changeguard_column`
+- `changeguard_timestamp`
 
-**Custom Properties represent LAST STATE ONLY.** Every write overwrites
-the same six keys. There is no historical log of past decisions anywhere
-in the system today — see [DataHub Memory](#6-datahub-memory).
+The Streamlit UI requires explicit writeback confirmation before either the
+report or decision persistence can run. The CLI always uses
+`confirm_writeback=False` and does not write to DataHub.
 
-Both writeback mechanisms (this one and the separate `save_document`
-report writeback) require `confirm_writeback=True`; if not confirmed,
-the corresponding step is `SKIPPED`, nothing is written.
+## Confirmed versus potential
 
-## 6. DataHub Memory
+**Confirmed impact** means DataHub returned explicit column-level lineage
+evidence. Confirmed downstream assets may contribute to the score according to
+the current risk policy.
 
-`get_entities` is now a genuinely used tool (previously required for
-connection but never called). It is used exclusively to read back
-ChangeGuard's own previously persisted decision.
+**Potential propagation** means table-level downstream propagation exists but
+column-level impact is not confirmed. Potential assets are visible for review
+and remediation planning, are de-duplicated against confirmed assets, and do
+not increase the risk score. They must not be described as broken or impacted
+with certainty.
 
-Real response shape (verified against a live `mcp-server-datahub`
-server):
+This distinction is evidence-aware, not a claim that DataHub's lineage graph is
+complete.
 
-```json
-[
-  {
-    "urn": "...",
-    "properties": {
-      "customProperties": [
-        {"key": "changeguard_decision", "value": "BLOCK"},
-        {"key": "changeguard_risk_score", "value": "60"},
-        {"key": "changeguard_severity", "value": "high"},
-        {"key": "changeguard_operation", "value": "drop"},
-        {"key": "changeguard_column", "value": "customer_id"},
-        {"key": "changeguard_timestamp", "value": "2026-08-09T02:40:44+00:00"}
-      ]
-    },
-    "platform": {...}, "health": [...], "schemaMetadata": {...},
-    "relatedDocuments": {...}
-  }
-]
-```
+## DataHub Memory
 
-`parse_persisted_context` (`contract_sentinel/datahub_writeback.py`)
-parses this into a `PersistedContext`, or returns `None` if no
-`changeguard_decision` key is present (nothing was ever persisted — not
-an error).
+DataHub Memory means only the **latest persisted ChangeGuard decision**. The six
+Custom Properties are overwritten on each persistence operation, so Memory is
+not history, an audit trail, or a decision log.
 
-If the resolved dataset/column/operation of the *current* run exactly
-match the persisted context, `AgentResult.previously_evaluated = True`
-and the Streamlit UI shows a **"Previously evaluated in DataHub"**
-badge. The system still re-runs `validate_schema`, `fetch_lineage`, and
-`assess_risk` in full — it never reuses the old score or skips any step
-because of a match.
+A later run reads this prior context through `get_entities`, then still performs
+fresh schema validation, lineage retrieval, and risk assessment. A matching
+dataset, column, and operation may produce a “Previously evaluated in DataHub”
+indicator, but previous context never changes the current score.
 
-## 7. MCP tools actually used
+Failure to read prior context is best-effort: it is shown as degraded/failed
+metadata retrieval and the current analysis continues without prior context.
 
-Inspected directly in `contract_sentinel/agent.py` and
-`contract_sentinel/datahub_mcp.py` (not inferred from `REQUIRED_TOOLS`):
+## Verified local Live scenarios
 
-| Tool | Actually called? | Where / why |
-|---|---|---|
-| `search` | Yes, every Live run | `resolve_urn` step — find the dataset by name |
-| `list_schema_fields` | Yes, every Live run | `validate_schema` step — verify the column (and rename target) exist |
-| `get_entities` | Yes, every Live run | `fetch_previous_context` step — read `properties.customProperties` for DataHub Memory |
-| `get_lineage` | Yes, twice per Live run | `fetch_lineage` (with `column` filter, confirmed impact) and `fetch_potential_downstream` (without `column`, potential impact) |
-| `save_document` | Conditionally, only if available and `confirm_writeback=True` | `writeback` step — optional Markdown report document |
-| `get_lineage_paths_between` | **No** | Listed in `DataHubMCPAdapter.REQUIRED_TOOLS` so an incompatible MCP server is rejected at connect time, but never invoked in the pipeline today |
+The following scenarios use the seeded local DataHub environment, not fixtures
+and not the public hosted application.
 
-## 8. Important architecture files
+### Safe Rename
 
-- `app.py` — Streamlit UI (Demo + Live modes), renders the agent's steps
-  in real time, the Results panel, DataHub Memory section, and the
-  Why Flagged / Blast Radius / Checklist / Full Report tabs.
-- `contract_sentinel/agent.py` — `ChangeGuardAgent`, the single pipeline
-  described in section 1. Owns all step sequencing and is the only
-  caller of `assess_change`.
-- `contract_sentinel/risk.py` — `assess_change`, the deterministic
-  scoring function (operation weights + downstream asset/critical/
-  dashboard bonuses, severity thresholds). Not touched by this handoff.
-- `contract_sentinel/datahub_mcp.py` — `DataHubMCPAdapter`, the typed
-  boundary over the injected MCP `call_tool` callable; declares
-  required/optional tools and wraps `get_lineage`/`get_entities`/
-  `save_document` calls.
-- `contract_sentinel/mcp_connection.py` — `MCPStdioClient` +
-  `create_live_adapter`, the real stdio transport to
-  `uvx mcp-server-datahub@latest`. Contains the Windows-hang fix in
-  `close()` (timeout + kill fallback) — see `AGENTS.md`.
-- `contract_sentinel/datahub_writeback.py` — `write_decision_to_datahub`
-  (writes the six `changeguard_*` custom properties via the DataHub SDK)
-  and `parse_persisted_context` (reads them back from a `get_entities`
-  response). Also `build_writeback_properties`, the pure function shared
-  by both directions.
-- `contract_sentinel/report.py` — `render_markdown`, builds the Full
-  Report Markdown (reasons, confirmed/potential blast radius, checklist,
-  and the Previous ChangeGuard Context section).
-- `contract_sentinel/cli.py` — the CI/CD gate CLI described in section 4.
-- Tests: `tests/test_agent.py` (pipeline + real MCP response-shape
-  tests, including `LiveModeShapeTests`), `tests/test_datahub_mcp.py`
-  (adapter/tool-availability tests), `tests/test_datahub_writeback.py`
-  (writeback property building + `parse_persisted_context`),
-  `tests/test_report.py`, `tests/test_risk.py`, `tests/test_cli.py`.
+- Dataset: `commerce.orders`
+- Column: `customer_id`
+- Operation: `rename`
+- New name: `cust_key`
+- Result: **50/100 — MEDIUM — ALLOW**
+- Confirmed: `analytics.customer_orders`
+- Potential: `analytics.sales_summary` (informational and unscored)
 
-## 9. Important design decisions
+### Dangerous Drop
 
-- Deterministic workflow: no LLM anywhere in the decision path.
-- Confirmed vs Potential are strictly separated: Confirmed comes only
-  from column-level `get_lineage`; Potential comes only from table-level
-  `get_lineage`, with confirmed URNs excluded to avoid double-counting.
-- Potential downstream propagation never affects the risk score.
-- The previous persisted decision (DataHub Memory) never affects the
-  current score — it is operator context only.
-- No ownership/domain/tags are fabricated. The seeded local catalog has
-  none set, and `get_entities`' current response shape does not expose
-  them anyway.
-- No GraphQL was added as a parallel enrichment path — DataHub Memory
-  reads exclusively through the existing MCP `get_entities` tool.
-- DataHub Memory is explicitly documented as "last persisted decision,"
-  never as a history or audit trail, in code comments, the UI, the
-  report, and `README.md`.
-- Best-effort metadata/context reads (`fetch_previous_context`,
-  `fetch_potential_downstream`) must never destroy an otherwise valid
-  analysis — both degrade to an empty/`None` result and continue the
-  pipeline on failure.
+- Dataset: `commerce.orders`
+- Column: `customer_id`
+- Operation: `drop`
+- Result: **60/100 — HIGH — BLOCK**
+- Confirmed: `analytics.customer_orders`
+- Potential: `analytics.sales_summary` (informational and unscored)
 
-## 10. Known limitations
+The scores are produced by the real pipeline, not hardcoded scenario outputs.
+With exactly one confirmed downstream consumer, the current policy adds five
+points to the 45-point rename or 55-point drop base weight.
 
-These are current and real as of this handoff (verified against the
-live code, not carried over from earlier, already-fixed issues):
+## Public Demo versus local Live
 
-- DataHub Memory is last-state only; there is no historical audit trail
-  of past ChangeGuard decisions anywhere in the system.
-- Ownership, Domain, and Tags are not available for Live-mode assets:
-  the seeded local catalog has none set, and the current
-  `mcp-server-datahub` `get_entities` response does not include
-  `ownership`/`domain`/`tags` fields at all.
-- Potential downstream propagation depends entirely on table-level
-  `get_lineage`; if DataHub's table-level lineage graph is incomplete,
-  potential assets will be missed (this mirrors a real DataHub
-  limitation, not a ChangeGuard bug).
-- The `fetch_potential_downstream` MCP call has been observed to
-  intermittently time out (`MCP request 'tools/call' timed out after
-  30s`) under contention on this local dev machine. It degrades to a
-  `FAILED` step without blocking the rest of the pipeline (per the
-  design decision in section 9), but the timeout itself has not been
-  investigated or fixed.
-- Running `contract_sentinel/cli.py` in Live mode on Windows can print an
-  `asyncio`/`ResourceWarning` traceback to stderr during interpreter
-  shutdown (`Event loop is closed`, `I/O operation on closed pipe`). This
-  happens after the real result has already been printed to stdout and
-  does not affect the exit code or `--json` output, but it has not been
-  cleaned up.
-- No Slack/Jira integration.
-- No LLM anywhere in the pipeline.
-- `get_lineage_paths_between` is required to connect but is not used —
-  see section 7.
+- **Public hosted app:** Demo mode only. It has no network path to the local
+  DataHub backend and must not be described as publicly providing Live DataHub
+  integration.
+- **Local development and submission video:** Live mode against the real local
+  DataHub environment. The Live Safe Rename and Dangerous Drop reference
+  scenarios demonstrated in the video use this environment.
 
-## 11. Latest stable state
+Live mode surfaces connection and query errors and never substitutes Demo
+fixtures.
 
-Stable commit before this handoff: `c36b321` ("Add DataHub-backed
-decision memory"). Tests at that commit: 60/60 passing.
+## Remediation
 
-(If this handoff's own documentation commit is pushed after this file is
-written, `git log` will show it directly above `c36b321` on `main`.)
+`contract_sentinel/remediation.py` centralizes deterministic remediation plan
+construction. The same structured plan is consumed by Streamlit, CLI/JSON, and
+the Markdown report.
 
-## 12. Recommended next work
+The plan is derived from the current change, decision, and confirmed/potential
+evidence. It does not use an LLM, change scoring, or guarantee safety. Describe
+it as remediation recommendations or a recommended path to re-evaluation.
 
-These are candidate ideas only — nothing below has been implemented, and
-none of it should be assumed to exist:
+## CLI-compatible CI gate
 
-1. A "Remediation Plan" / "How to Make This Safe?" feature — has not been
-   designed or implemented.
-2. A more polished `changeguard check` CLI command/alias — the current
-   CLI is `python -m contract_sentinel.cli`; no wrapper script exists.
-3. Investigate and, if safely reproducible, clean up the Windows
-   `asyncio` shutdown warning noted in section 10 — not yet attempted.
-4. Final demo/video preparation for the hackathon submission — not
-   started as part of this codebase.
+Run the gate with `python -m contract_sentinel.cli`. It reuses
+`ChangeGuardAgent` and does not contain a separate scoring engine.
+
+- Exit `0`: ALLOW
+- Exit `1`: BLOCK
+- Exit `2`: execution or configuration ERROR
+
+`--json` returns valid JSON for success, BLOCK, and error behavior. The CLI
+never writes back. `examples/github-actions-gate.yml` is a GitHub Actions
+workflow example demonstrating the exit-code contract; it is not a claim that
+production CI integration is deployed.
+
+## MCP reliability state
+
+The MCP stdio lifecycle in `contract_sentinel/mcp_connection.py` has a dedicated
+reliability fix and tests:
+
+- Child stderr is continuously drained into a bounded diagnostic tail.
+- A pending future is registered before each JSON-RPC request write.
+- Pending futures are removed on completion, error, timeout, and cancellation.
+- Reader failures propagate immediately to pending requests.
+- New requests are rejected after reader failure or shutdown begins.
+- Initialization failure cleans up the subprocess.
+- The existing terminate/wait/kill fallback remains bounded.
+- No request or startup timeout value was changed.
+
+Four sequential Live analyses—DROP, RENAME, DROP, RENAME—completed with the
+expected results. No orphan `uvx`/`mcp-server-datahub` processes remained, and
+the Windows asyncio shutdown warning was not reproduced after the fix.
+
+The current command launches `mcp-server-datahub@latest`; the MCP server version
+is not pinned.
+
+## Current limitations
+
+- DataHub Memory is latest state only, not historical storage.
+- Incomplete lineage can produce incomplete evidence; potential propagation is
+  not confirmed column impact.
+- Scoring weights are transparent policy choices, not calibrated
+  probabilities. Ownership, domain, tags, and criticality do not drive Live
+  scoring today.
+- The hosted app is Demo-only, and the controlled implementation is not
+  production-hardened. SDK persistence identity assumptions are verified for
+  the seeded Snowflake/PROD local scenario.
+
+## Final Submission Copy
+
+### A. One-line tagline
+
+ChangeGuard turns DataHub lineage into a pre-deployment ALLOW/BLOCK gate, with
+evidence-aware blast radius and remediation before schemas break production.
+
+### B. Three-sentence description
+
+ChangeGuard evaluates proposed schema changes before deployment by resolving
+the dataset in DataHub, validating its schema, and tracing confirmed column
+consumers. It separates proven column impact from potential table propagation,
+then applies deterministic policy to produce an ALLOW/BLOCK decision and
+operation-specific remediation through the same UI and CI-compatible engine.
+With explicit user confirmation, it can persist the latest decision or full
+report to DataHub while every future risk assessment is recomputed from fresh
+metadata evidence.
+
+### C. Feature bullets
+
+- Live schema validation and lineage retrieval through the official DataHub MCP
+  Server
+- Evidence-aware separation of confirmed and potential downstream propagation
+- Transparent deterministic ALLOW/BLOCK policy
+- Operation-specific remediation recommendations
+- Shared Streamlit and CLI/CI-compatible engine with `0`/`1`/`2` exit codes
+- Optional latest-decision and full-report writeback with explicit confirmation
+
+### D. Truthful limitations and notes
+
+- The public hosted app is Demo-only; verified Live scenarios run against local
+  DataHub.
+- DataHub Memory stores only the latest persisted decision, not history.
+- Results depend on available lineage evidence, and scoring weights are policy
+  choices rather than calibrated probabilities.
+- This is a controlled hackathon implementation, not a production-hardened
+  deployment.
+
+## Future work
+
+The following items are not current capabilities:
+
+- Pin and lock the MCP server/dependency environment for reproducibility.
+- Preserve resolved entity identity end-to-end across broader DataHub platform
+  and environment combinations.
+- Harden URL, token, and shared-deployment security boundaries.
+- Calibrate policy using observed incidents and add an explicit
+  insufficient-evidence/UNKNOWN policy if desired.
+- Parse real migration artifacts and connect the workflow example to a chosen
+  production CI system.
+
+Do not present future work as implemented functionality.

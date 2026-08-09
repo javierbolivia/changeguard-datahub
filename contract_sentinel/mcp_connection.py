@@ -193,13 +193,42 @@ class MCPStdioClient:
         return self._tools
 
     async def close(self) -> None:
-        """Shut down the MCP server process."""
+        """Shut down the MCP server process.
+
+        On Windows, ``Process.wait()`` can hang indefinitely after
+        ``terminate()`` if the stdout-reading task was only cancelled
+        (not awaited) beforehand. To guarantee this method always
+        returns, the reader task is awaited (swallowing the expected
+        CancelledError) before terminating, and both ``terminate()`` and
+        the final ``wait()`` are bounded by a timeout with a ``kill()``
+        fallback.
+        """
         if self._reader_task:
             self._reader_task.cancel()
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
         if self._process.stdin:
             self._process.stdin.close()
-        self._process.terminate()
-        await self._process.wait()
+
+        try:
+            self._process.terminate()
+        except ProcessLookupError:
+            pass  # Already exited.
+
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass  # Give up waiting; the process was at least signalled.
 
 
 async def create_live_adapter(

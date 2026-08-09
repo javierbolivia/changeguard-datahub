@@ -56,6 +56,7 @@ class AgentTests(unittest.TestCase):
 
         wb_step = next(s for s in result.steps if s.name == "writeback")
         self.assertEqual(wb_step.status, StepStatus.SKIPPED)
+        self.assertEqual(wb_step.result["reason"], "user confirmation required")
 
     def test_persist_decision_skipped_without_confirmation(self):
         calls = []
@@ -499,6 +500,105 @@ class LiveModeShapeTests(unittest.TestCase):
         self.assertIsNotNone(result.impact)
         decision_step = next(s for s in result.steps if s.name == "decision")
         self.assertEqual(decision_step.status, StepStatus.SUCCESS)
+
+    def test_writeback_skipped_when_save_document_unavailable(self):
+        """save_document is an optional Document Tool that mcp-server-datahub
+        hides when the target DataHub instance has no documents yet. Its
+        absence must be reported as SKIPPED with a clear reason, never as
+        FAILED — this is a server capability limitation, not a ChangeGuard
+        error."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        tools_without_save_document = self.TOOLS  # base TOOLS has no save_document
+        adapter = DataHubMCPAdapter(caller, tools_without_save_document)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        wb_step = next(s for s in result.steps if s.name == "writeback")
+        self.assertEqual(wb_step.status, StepStatus.SKIPPED)
+        self.assertEqual(
+            wb_step.result["reason"],
+            "save_document not available on this DataHub server",
+        )
+        # The rest of the pipeline (score/decision) must be unaffected.
+        self.assertIsNotNone(result.impact)
+        decision_step = next(s for s in result.steps if s.name == "decision")
+        self.assertEqual(decision_step.status, StepStatus.SUCCESS)
+
+    def test_writeback_succeeds_when_save_document_available(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            if name == "save_document":
+                return {"success": True}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        tools_with_save_document = self.TOOLS | {"save_document"}
+        adapter = DataHubMCPAdapter(caller, tools_with_save_document)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        wb_step = next(s for s in result.steps if s.name == "writeback")
+        self.assertEqual(wb_step.status, StepStatus.SUCCESS)
+
+    def test_writeback_failed_when_save_document_call_raises(self):
+        """save_document is available but the actual call fails - this is
+        a real failure and must surface as FAILED, not SKIPPED."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            if name == "save_document":
+                raise ConnectionError("DataHub GMS unreachable")
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        tools_with_save_document = self.TOOLS | {"save_document"}
+        adapter = DataHubMCPAdapter(caller, tools_with_save_document)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        wb_step = next(s for s in result.steps if s.name == "writeback")
+        self.assertEqual(wb_step.status, StepStatus.FAILED)
+        self.assertIn("unreachable", wb_step.error)
+        # The rest of the pipeline (score/decision) must be unaffected.
+        self.assertIsNotNone(result.impact)
 
     def test_demo_mode_skips_schema_validation(self):
         """Demo mode has no live schema to check against and must keep

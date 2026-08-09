@@ -456,11 +456,22 @@ class ChangeGuardAgent:
 
         if not confirm_writeback:
             step6.status = StepStatus.SKIPPED
-            step6.result = {"reason": "Writeback requires explicit user confirmation"}
+            step6.result = {"reason": "user confirmation required"}
             step6.duration_ms = (time.perf_counter() - t0) * 1000
         elif not self._mcp:
             step6.status = StepStatus.SKIPPED
             step6.result = {"reason": "Demo mode — no DataHub connection for writeback"}
+            step6.duration_ms = (time.perf_counter() - t0) * 1000
+        elif not self._mcp.save_document_available:
+            # save_document is an optional Document Tool that
+            # mcp-server-datahub hides when the target DataHub instance
+            # has no documents yet. Its absence is a capability limitation
+            # of the connected server, not a ChangeGuard failure, so this
+            # must be reported as SKIPPED rather than FAILED.
+            step6.status = StepStatus.SKIPPED
+            step6.result = {
+                "reason": "save_document not available on this DataHub server"
+            }
             step6.duration_ms = (time.perf_counter() - t0) * 1000
         else:
             try:

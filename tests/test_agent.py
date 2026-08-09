@@ -13,6 +13,29 @@ from contract_sentinel.risk import Change
 
 
 class AgentTests(unittest.TestCase):
+    def test_final_decision_is_derived_from_the_canonical_decision_step(self):
+        result = AgentResult(Change("commerce.orders", "order_id", "rename"))
+        decision_step = AgentStep(
+            name="decision",
+            description="Rendering final deployment decision",
+            status=StepStatus.RUNNING,
+            result={
+                "decision": "REVIEW",
+                "reason": "Insufficient confirmed column-level evidence.",
+            },
+        )
+        result.steps.append(decision_step)
+
+        self.assertIsNone(result.decision)
+        decision_step.status = StepStatus.SUCCESS
+        self.assertEqual(result.decision, "REVIEW")
+        self.assertEqual(
+            result.decision_reason,
+            "Insufficient confirmed column-level evidence.",
+        )
+        with self.assertRaises(AttributeError):
+            result.decision = "ALLOW"
+
     def test_agent_runs_full_pipeline_in_demo_mode(self):
         agent = ChangeGuardAgent()
         result = agent.run(Change("commerce.orders", "customer_id", "rename"))

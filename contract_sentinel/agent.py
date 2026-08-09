@@ -65,8 +65,6 @@ class AgentResult:
     change: Change
     steps: list[AgentStep] = field(default_factory=list)
     impact: Impact | None = None
-    decision: str | None = None
-    decision_reason: str | None = None
     remediation: RemediationPlan | None = None
     report: str | None = None
     downstream_assets: list[dict] = field(default_factory=list)
@@ -83,6 +81,38 @@ class AgentResult:
     # True only when previous_context exists AND its dataset/column/
     # operation exactly match the change being evaluated right now.
     previously_evaluated: bool = False
+
+    @property
+    def decision(self) -> str | None:
+        """Return the final decision from the canonical decision step."""
+        step = next(
+            (
+                item
+                for item in self.steps
+                if item.name == "decision" and item.status == StepStatus.SUCCESS
+            ),
+            None,
+        )
+        if not step or not isinstance(step.result, dict):
+            return None
+        value = step.result.get("decision")
+        return value if value in {"ALLOW", "BLOCK", "REVIEW"} else None
+
+    @property
+    def decision_reason(self) -> str | None:
+        """Return the evidence reason recorded by the final decision step."""
+        step = next(
+            (
+                item
+                for item in self.steps
+                if item.name == "decision" and item.status == StepStatus.SUCCESS
+            ),
+            None,
+        )
+        if not step or not isinstance(step.result, dict):
+            return None
+        reason = step.result.get("reason")
+        return reason if isinstance(reason, str) and reason else None
 
 
 # Type for the callback that receives step updates in real-time
@@ -623,11 +653,10 @@ class ChangeGuardAgent:
         self._emit(step7)
         t0 = time.perf_counter()
 
-        result.decision = decision
-        result.decision_reason = decision_reason
         step7.result = {
             "decision": decision,
             "severity": impact.severity,
+            "reason": decision_reason,
             "message": (
                 f"Deployment BLOCKED — risk score {impact.score}/100 ({impact.severity}). "
                 f"Complete the migration checklist before proceeding."

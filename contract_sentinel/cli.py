@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import json
 import sys
+from dataclasses import asdict
 
 from .agent import AgentResult, ChangeGuardAgent, StepStatus
 from .mcp_connection import create_live_adapter
@@ -137,6 +138,13 @@ def _human_report(args: argparse.Namespace, result: AgentResult, decision: str) 
     lines.extend(f"- {asset['name']}" for asset in result.downstream_assets)
     lines.append("Potential:")
     lines.extend(f"- {asset['name']}" for asset in result.potential_downstream_assets)
+    if result.remediation is not None:
+        lines.append("Remediation:")
+        lines.append(result.remediation.summary)
+        lines.extend(
+            f"{index}. {action.title}: {action.detail}"
+            for index, action in enumerate(result.remediation.steps, 1)
+        )
     return "\n".join(lines)
 
 
@@ -152,6 +160,9 @@ def _json_report(args: argparse.Namespace, result: AgentResult, decision: str) -
         "confirmed_affected_assets": len(result.downstream_assets),
         "potential_downstream_assets": len(result.potential_downstream_assets),
         "mode": result.mode,
+        "remediation": (
+            asdict(result.remediation) if result.remediation is not None else None
+        ),
     }
     return json.dumps(payload)
 

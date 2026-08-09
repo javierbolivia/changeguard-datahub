@@ -434,8 +434,14 @@ if result.impact:
             st.caption(f"Evaluated: {pc.timestamp}")
 
     # Detailed sections in tabs
-    tab_reasons, tab_blast, tab_checklist, tab_report = st.tabs(
-        ["\U0001f50d Why Flagged", "\U0001f4a5 Blast Radius", "\u2705 Checklist", "\U0001f4c4 Full Report"]
+    tab_reasons, tab_blast, tab_remediation, tab_checklist, tab_report = st.tabs(
+        [
+            "\U0001f50d Why Flagged",
+            "\U0001f4a5 Blast Radius",
+            "\U0001f6e0\ufe0f How to Make This Safe",
+            "\u2705 Checklist",
+            "\U0001f4c4 Full Report",
+        ]
     )
 
     with tab_reasons:
@@ -476,6 +482,20 @@ if result.impact:
                         f"dependency for `{result.change.column}` is available."
                     )
                     st.write(f"**URN:** `{asset.get('urn', 'N/A')}`")
+
+    with tab_remediation:
+        if result.remediation is not None:
+            if result.remediation.required:
+                st.error("\U0001f6d1 **BLOCKED**")
+                st.markdown("### Recommended path to re-evaluation")
+            else:
+                st.success("\u2705 **ALLOW — No blocking remediation required**")
+                st.markdown("### Review recommendations")
+
+            st.write(result.remediation.summary)
+            for index, action in enumerate(result.remediation.steps, 1):
+                st.markdown(f"**{index}. {action.title}**")
+                st.write(action.detail)
 
     with tab_checklist:
         st.markdown("Complete these steps before deploying:")

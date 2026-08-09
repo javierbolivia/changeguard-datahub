@@ -16,6 +16,19 @@ Schema changes (renaming a column, dropping a field, changing a type) routinely 
 
 ---
 
+## Remediation Plan: How to Make This Safe?
+
+After each current analysis, ChangeGuard produces deterministic recommendations
+for the next review or re-evaluation cycle. The plan does not modify risk
+scoring or promise zero risk: it gives operation-specific guidance from the
+same current `Change`, decision, and lineage results already held by the agent.
+Confirmed column-level consumers receive migration or compatibility guidance;
+potential table-level propagation remains a separate, informational review set
+whose column impact is explicitly not confirmed. Streamlit, the CLI, JSON
+output, and the Full Report all consume the same structured remediation result.
+
+---
+
 ## Architecture: ChangeGuard → MCP → DataHub
 
 ```
@@ -366,6 +379,7 @@ changeguard-datahub/
 │   ├── __init__.py                 # Package exports
 │   ├── cli.py                      # CI/CD gate CLI (0=ALLOW, 1=BLOCK, 2=ERROR)
 │   ├── agent.py                    # Autonomous 11-step agent pipeline
+│   ├── remediation.py              # Deterministic remediation plan rules
 │   ├── risk.py                     # Transparent risk scoring engine
 │   ├── report.py                   # Markdown report generator
 │   ├── fixtures.py                 # Reproducible demo metadata

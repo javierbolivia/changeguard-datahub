@@ -25,6 +25,7 @@ from typing import Any, Callable
 from .datahub_mcp import DataHubMCPAdapter, ToolCaller
 from .datahub_writeback import PersistedContext, parse_persisted_context
 from .fixtures import SHOWCASE_ASSETS
+from .remediation import RemediationPlan, build_remediation_plan
 from .report import render_markdown
 from .risk import Change, Impact, assess_change
 
@@ -62,6 +63,7 @@ class AgentResult:
     change: Change
     steps: list[AgentStep] = field(default_factory=list)
     impact: Impact | None = None
+    remediation: RemediationPlan | None = None
     report: str | None = None
     downstream_assets: list[dict] = field(default_factory=list)
     potential_downstream_assets: list[dict] = field(default_factory=list)
@@ -478,6 +480,18 @@ class ChangeGuardAgent:
             return result
         self._emit(step4)
 
+        # Remediation is derived application data, not a new pipeline step.
+        # It uses only the current assessment and the already-fetched lineage
+        # sets; previous DataHub context is deliberately not an input.
+        decision = "BLOCK" if impact.severity in {"critical", "high"} else "ALLOW"
+        result.remediation = build_remediation_plan(
+            change=change,
+            severity=impact.severity,
+            decision=decision,
+            confirmed_assets=downstream,
+            potential_assets=result.potential_downstream_assets,
+        )
+
         # Step 5: Generate impact report
         step5 = AgentStep(
             name="generate_report",
@@ -490,11 +504,12 @@ class ChangeGuardAgent:
 
         try:
             report = render_markdown(
-                change,
-                impact,
-                downstream,
-                result.potential_downstream_assets,
-                result.previous_context,
+                change=change,
+                impact=impact,
+                assets=downstream,
+                potential_assets=result.potential_downstream_assets,
+                previous_context=result.previous_context,
+                remediation=result.remediation,
             )
             result.report = report
             step5.result = {"report_length": len(report), "has_checklist": True}
@@ -567,7 +582,6 @@ class ChangeGuardAgent:
         self._emit(step7)
         t0 = time.perf_counter()
 
-        decision = "BLOCK" if impact.severity in {"critical", "high"} else "ALLOW"
         step7.result = {
             "decision": decision,
             "severity": impact.severity,

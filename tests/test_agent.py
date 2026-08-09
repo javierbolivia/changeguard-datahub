@@ -21,6 +21,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.mode, "demo")
         self.assertEqual(len(result.steps), 11)
         self.assertIsNotNone(result.impact)
+        self.assertIsNotNone(result.remediation)
         self.assertIsNotNone(result.report)
         self.assertEqual(result.impact.severity, "critical")
         self.assertGreaterEqual(result.impact.score, 80)

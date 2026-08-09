@@ -133,6 +133,8 @@ class CliExitCodeTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, cli.EXIT_ALLOW)
         self.assertIn("Decision: ALLOW", out)
+        self.assertIn("Remediation:", out)
+        self.assertIn("No blocking remediation", out)
 
     def test_block_decision_exits_one(self):
         with _patched_live_adapter():
@@ -150,6 +152,11 @@ class CliExitCodeTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, cli.EXIT_BLOCK)
         self.assertIn("Decision: BLOCK", out)
+        self.assertIn("Remediation:", out)
+        self.assertIn("Recommended path to re-evaluation", out)
+        self.assertIn("analytics.customer_orders", out)
+        self.assertIn("analytics.sales_summary", out)
+        self.assertIn("column-level impact is not confirmed", out)
 
     def test_dataset_not_found_exits_two(self):
         with _patched_live_adapter():
@@ -264,6 +271,16 @@ class CliJsonOutputTests(unittest.TestCase):
         self.assertEqual(payload["confirmed_affected_assets"], 1)
         self.assertEqual(payload["potential_downstream_assets"], 1)
         self.assertEqual(payload["mode"], "live")
+        self.assertTrue(payload["remediation"]["required"])
+        self.assertIn("Recommended path to re-evaluation", payload["remediation"]["summary"])
+        potential_steps = [
+            step
+            for step in payload["remediation"]["steps"]
+            if step["kind"] == "potential_review"
+        ]
+        self.assertEqual(len(potential_steps), 1)
+        self.assertEqual(potential_steps[0]["assets"], ["analytics.sales_summary"])
+        self.assertIn("not confirmed", potential_steps[0]["detail"])
         self.assertEqual(exit_code, cli.EXIT_BLOCK)
 
     def test_json_output_for_allow_case(self):
@@ -287,6 +304,8 @@ class CliJsonOutputTests(unittest.TestCase):
         self.assertEqual(payload["decision"], "ALLOW")
         self.assertEqual(payload["risk_score"], 50)
         self.assertEqual(payload["severity"], "medium")
+        self.assertFalse(payload["remediation"]["required"])
+        self.assertNotIn("blocked", payload["remediation"]["summary"].casefold())
         self.assertEqual(exit_code, cli.EXIT_ALLOW)
 
 

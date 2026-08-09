@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .datahub_writeback import PersistedContext
+from .remediation import RemediationPlan
 from .risk import Change, Impact
 
 
@@ -12,6 +13,7 @@ def render_markdown(
     assets: list[dict],
     potential_assets: list[dict] | None = None,
     previous_context: PersistedContext | None = None,
+    remediation: RemediationPlan | None = None,
 ) -> str:
     potential_assets = potential_assets or []
     lines = [
@@ -50,6 +52,12 @@ def render_markdown(
                 f"- **{asset['name']}** ({asset['kind']})  "
                 f"\n  `{asset.get('path', 'lineage path unavailable')}`"
             )
+
+    if remediation is not None:
+        lines.extend(["", "## Remediation Plan", remediation.summary])
+        for index, action in enumerate(remediation.steps, 1):
+            lines.append(f"{index}. **{action.title}** — {action.detail}")
+
     lines.extend(["", "## Migration checklist"])
     lines.extend(f"- [ ] {item}" for item in impact.checklist)
     if potential_assets:
@@ -80,4 +88,3 @@ def render_markdown(
         lines.append("No previously persisted ChangeGuard decision found for this dataset.")
 
     return "\n".join(lines)
-

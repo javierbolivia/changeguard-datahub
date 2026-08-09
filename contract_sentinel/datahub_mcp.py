@@ -57,11 +57,37 @@ class DataHubMCPAdapter:
             await self._close()
 
     async def downstream_lineage(self, urn: str, column: str) -> dict[str, Any]:
+        """Column-level downstream lineage.
+
+        Only returns entities for which DataHub has a confirmed
+        column-level lineage relationship with ``column``. This is the
+        source of truth for CONFIRMED impact and risk scoring.
+        """
         return await self._call_tool(
             "get_lineage",
             {
                 "urn": urn,
                 "column": column,
+                "upstream": False,
+                "max_hops": 3,
+                "max_results": 30,
+            },
+        )
+
+    async def downstream_lineage_table_level(self, urn: str) -> dict[str, Any]:
+        """Table-level downstream lineage (no ``column`` filter).
+
+        DataHub's column-level query only returns entities with a proven
+        column-to-column dependency. This broader, table-level query can
+        surface additional downstream datasets that are not (yet) known
+        to depend on the specific column — these must be treated as
+        POTENTIAL downstream propagation, not confirmed impact, and must
+        never be counted in risk scoring.
+        """
+        return await self._call_tool(
+            "get_lineage",
+            {
+                "urn": urn,
                 "upstream": False,
                 "max_hops": 3,
                 "max_results": 30,

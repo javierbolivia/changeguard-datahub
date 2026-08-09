@@ -61,6 +61,7 @@ class AgentResult:
     impact: Impact | None = None
     report: str | None = None
     downstream_assets: list[dict] = field(default_factory=list)
+    potential_downstream_assets: list[dict] = field(default_factory=list)
     writeback_success: bool = False
     mode: str = "demo"  # "demo" or "live"
 
@@ -324,6 +325,70 @@ class ChangeGuardAgent:
         self._emit(step3)
         result.downstream_assets = downstream
 
+        # Step 3b: Fetch table-level downstream lineage (Live mode only)
+        # to surface POTENTIAL downstream propagation - datasets that are
+        # downstream of the table but for which DataHub has no confirmed
+        # column-level dependency on this specific column. These are
+        # informational only: they are never scored, never counted as
+        # confirmed affected assets, and a failure here must not block
+        # the rest of the pipeline (risk scoring still only depends on
+        # the confirmed column-level result from Step 3).
+        step3b = AgentStep(
+            name="fetch_potential_downstream",
+            description="Fetching table-level downstream lineage for potential propagation",
+        )
+        result.steps.append(step3b)
+        step3b.status = StepStatus.RUNNING
+        self._emit(step3b)
+        t0 = time.perf_counter()
+
+        if self._mcp and dataset_urn:
+            try:
+                table_lineage_data = await self._mcp.downstream_lineage_table_level(
+                    dataset_urn
+                )
+                raw_table_assets = table_lineage_data.get("downstreams", {}).get(
+                    "searchResults", []
+                )
+                confirmed_urns = {a.get("urn") for a in downstream if a.get("urn")}
+                potential: list[dict] = []
+                for item in raw_table_assets:
+                    entity = item.get("entity", {})
+                    urn = entity.get("urn", "")
+                    if not urn or urn in confirmed_urns:
+                        # Already confirmed via column-level lineage, or no
+                        # URN to identify it by - skip to avoid duplicates.
+                        continue
+                    name = entity.get("name") or entity.get("properties", {}).get(
+                        "name", urn
+                    )
+                    potential.append(
+                        {
+                            "name": name,
+                            "urn": urn,
+                            "kind": _classify_asset(entity),
+                            "path": f"{change.dataset} -> {name}",
+                        }
+                    )
+                result.potential_downstream_assets = potential
+                step3b.result = {
+                    "source": "datahub_mcp_table_level",
+                    "potential_assets_found": len(potential),
+                }
+                step3b.status = StepStatus.SUCCESS
+                step3b.duration_ms = (time.perf_counter() - t0) * 1000
+            except Exception as e:
+                # Informational step only - never block the pipeline or
+                # affect the risk score if this call fails.
+                step3b.status = StepStatus.FAILED
+                step3b.error = str(e)
+                step3b.duration_ms = (time.perf_counter() - t0) * 1000
+        else:
+            step3b.status = StepStatus.SKIPPED
+            step3b.result = {"reason": "Demo mode — no live table-level lineage to fetch"}
+            step3b.duration_ms = (time.perf_counter() - t0) * 1000
+        self._emit(step3b)
+
         # Step 4: Assess risk
         step4 = AgentStep(
             name="assess_risk",
@@ -364,7 +429,9 @@ class ChangeGuardAgent:
         t0 = time.perf_counter()
 
         try:
-            report = render_markdown(change, impact, downstream)
+            report = render_markdown(
+                change, impact, downstream, result.potential_downstream_assets
+            )
             result.report = report
             step5.result = {"report_length": len(report), "has_checklist": True}
             step5.status = StepStatus.SUCCESS

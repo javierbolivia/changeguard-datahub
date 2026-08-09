@@ -19,7 +19,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertIsInstance(result, AgentResult)
         self.assertEqual(result.mode, "demo")
-        self.assertEqual(len(result.steps), 9)
+        self.assertEqual(len(result.steps), 10)
         self.assertIsNotNone(result.impact)
         self.assertIsNotNone(result.report)
         self.assertEqual(result.impact.severity, "critical")
@@ -30,8 +30,8 @@ class AgentTests(unittest.TestCase):
         agent = ChangeGuardAgent(on_step_update=lambda s: events.append(s.status))
         agent.run(Change("commerce.orders", "customer_id", "drop"))
 
-        # Each step emits RUNNING + final status = at least 18 events (9 steps)
-        self.assertGreaterEqual(len(events), 18)
+        # Each step emits RUNNING + final status = at least 20 events (10 steps)
+        self.assertGreaterEqual(len(events), 20)
         # All steps complete (SUCCESS or SKIPPED)
         final_statuses = [events[i] for i in range(1, len(events), 2)]
         for status in final_statuses:
@@ -198,20 +198,22 @@ class LiveModeShapeTests(unittest.TestCase):
             if name == "list_schema_fields":
                 return {"fields": [{"fieldPath": "customer_id"}]}
             if name == "get_lineage":
-                return {
-                    "downstreams": {
-                        "searchResults": [
-                            {
-                                "entity": {
-                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
-                                    "properties": {"name": "analytics.customer_orders"},
-                                },
-                                "degree": 1,
-                                "lineageColumns": ["customer_id"],
-                            }
-                        ]
+                if "column" in arguments:
+                    return {
+                        "downstreams": {
+                            "searchResults": [
+                                {
+                                    "entity": {
+                                        "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                        "properties": {"name": "analytics.customer_orders"},
+                                    },
+                                    "degree": 1,
+                                    "lineageColumns": ["customer_id"],
+                                }
+                            ]
+                        }
                     }
-                }
+                return {"downstreams": {"searchResults": []}}
             raise AssertionError(f"unexpected tool call: {name}")
 
         adapter = self._make_adapter(caller)
@@ -383,6 +385,120 @@ class LiveModeShapeTests(unittest.TestCase):
         validate_step = next(s for s in result.steps if s.name == "validate_schema")
         self.assertEqual(validate_step.status, StepStatus.SUCCESS)
         self.assertIsNotNone(result.impact)
+
+    def test_potential_downstream_confirmed_and_excludes_duplicates(self):
+        """A dataset with confirmed column-level lineage must appear only
+        in downstream_assets; a dataset only visible in the table-level
+        query must appear only in potential_downstream_assets, never both,
+        and must never affect the risk score."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                if "column" in arguments:
+                    # Confirmed column-level: only customer_orders
+                    return {
+                        "downstreams": {
+                            "searchResults": [
+                                {
+                                    "entity": {
+                                        "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                        "name": "analytics.customer_orders",
+                                    },
+                                    "degree": 1,
+                                }
+                            ]
+                        }
+                    }
+                # Table-level: both customer_orders (degree 1) and
+                # sales_summary (degree 2) - customer_orders must be
+                # de-duplicated since it is already confirmed.
+                return {
+                    "downstreams": {
+                        "searchResults": [
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                    "name": "analytics.customer_orders",
+                                },
+                                "degree": 1,
+                            },
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.sales_summary,PROD)",
+                                    "name": "analytics.sales_summary",
+                                },
+                                "degree": 2,
+                            },
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
+
+        # Confirmed impact: only customer_orders.
+        confirmed_urns = {a["urn"] for a in result.downstream_assets}
+        self.assertEqual(
+            confirmed_urns,
+            {"urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)"},
+        )
+
+        # Potential downstream: only sales_summary (customer_orders excluded
+        # as a duplicate of the confirmed set).
+        potential_urns = {a["urn"] for a in result.potential_downstream_assets}
+        self.assertEqual(
+            potential_urns,
+            {"urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.sales_summary,PROD)"},
+        )
+
+        # No overlap between the two sets.
+        self.assertEqual(confirmed_urns & potential_urns, set())
+
+        # Risk score must be based only on the confirmed set (1 asset):
+        # matches the already-verified real scenario (50/100, medium, ALLOW).
+        self.assertEqual(result.impact.score, 50)
+        self.assertEqual(result.impact.severity, "medium")
+        self.assertEqual(len(result.impact.affected_assets), 1)
+
+    def test_potential_downstream_failure_does_not_block_pipeline(self):
+        """fetch_potential_downstream is informational only - a failure
+        there must not prevent risk scoring or the final decision."""
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"}}
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                if "column" in arguments:
+                    return {"downstreams": {"searchResults": []}}
+                raise ConnectionError("table-level lineage unavailable")
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        adapter = self._make_adapter(caller)
+        agent = ChangeGuardAgent(mcp_adapter=adapter)
+        result = agent.run(Change("commerce.orders", "customer_id", "rename"))
+
+        potential_step = next(s for s in result.steps if s.name == "fetch_potential_downstream")
+        self.assertEqual(potential_step.status, StepStatus.FAILED)
+        # Pipeline continues: risk assessment and decision still complete.
+        self.assertIsNotNone(result.impact)
+        decision_step = next(s for s in result.steps if s.name == "decision")
+        self.assertEqual(decision_step.status, StepStatus.SUCCESS)
 
     def test_demo_mode_skips_schema_validation(self):
         """Demo mode has no live schema to check against and must keep

@@ -277,6 +277,7 @@ STEP_NAMES = {
     "resolve_urn": "Resolve Dataset in DataHub",
     "validate_schema": "Validate Column Against Schema",
     "fetch_lineage": "Fetch Downstream Lineage",
+    "fetch_potential_downstream": "Fetch Potential Downstream Propagation",
     "assess_risk": "Calculate Risk Score",
     "generate_report": "Generate Impact Report",
     "writeback": "Write Back to DataHub",
@@ -304,9 +305,9 @@ def render_step(step: AgentStep, placeholder) -> None:
         placeholder.markdown(f"{icon} **{label}** — Pending")
 
 
-# Pre-create 9 placeholders
+# Pre-create 10 placeholders
 with step_container:
-    for _ in range(9):
+    for _ in range(10):
         steps_placeholders.append(st.empty())
 
 # Track step index
@@ -422,6 +423,8 @@ if result.impact:
             st.markdown(f"- {reason}")
 
     with tab_blast:
+        st.markdown("**\u2705 CONFIRMED COLUMN IMPACT**")
+        st.caption("DataHub shows a confirmed column-level lineage dependency.")
         for asset in result.downstream_assets:
             with st.expander(
                 f"**{asset['name']}** · {asset['kind']} · Owner: {asset['owner']}",
@@ -432,6 +435,27 @@ if result.impact:
                 cols[0].write(f"**Type:** {asset['kind']}")
                 cols[1].write(f"**Critical:** {'Yes' if asset.get('critical') else 'No'}")
                 cols[2].write(f"**URN:** `{asset.get('urn', 'N/A')}`")
+
+        if result.potential_downstream_assets:
+            st.divider()
+            st.markdown("**\u26a0\ufe0f POTENTIAL DOWNSTREAM PROPAGATION**")
+            st.caption(
+                "Table-level downstream dependency. No confirmed "
+                f"`{result.change.column}` column lineage is available — "
+                "not counted in the risk score."
+            )
+            for asset in result.potential_downstream_assets:
+                with st.expander(
+                    f"**{asset['name']}** · {asset['kind']}",
+                    expanded=False,
+                ):
+                    st.code(asset.get("path", ""), language=None)
+                    st.write(
+                        "Potential downstream — DataHub shows a downstream "
+                        "dataset relationship, but no column-level "
+                        f"dependency for `{result.change.column}` is available."
+                    )
+                    st.write(f"**URN:** `{asset.get('urn', 'N/A')}`")
 
     with tab_checklist:
         st.markdown("Complete these steps before deploying:")
@@ -453,7 +477,7 @@ if result.impact:
     with st.expander("\u23f1\ufe0f Execution Summary"):
         total_ms = sum(s.duration_ms for s in result.steps)
         st.write(f"**Total execution time:** {total_ms:.0f}ms")
-        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/9")
+        st.write(f"**Steps completed:** {sum(1 for s in result.steps if s.status == StepStatus.SUCCESS)}/10")
         st.write(f"**Data source:** {result.mode}")
         for step in result.steps:
             icon = STEP_ICONS.get(step.status, "?")

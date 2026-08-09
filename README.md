@@ -287,6 +287,28 @@ the `changeguard_*` custom properties will be listed there.
 
 ---
 
+## CI/CD Gate
+
+ChangeGuard exposes a CI-compatible exit code through `contract_sentinel/cli.py`, so a schema change can be gated in a pipeline without going through the Streamlit UI. It reuses the exact same `ChangeGuardAgent` and DataHub MCP integration as the UI — no separate scoring logic.
+
+```bash
+python -m contract_sentinel.cli \
+  --dataset commerce.orders \
+  --column customer_id \
+  --operation drop \
+  --mode live \
+  --datahub-url http://localhost:8080 \
+  --json
+```
+
+- **exit 0** = `ALLOW`
+- **exit 1** = `BLOCK`
+- **exit 2** = execution/configuration error (dataset not found, column not found, DataHub/MCP unreachable, invalid arguments)
+
+The CLI never writes back to DataHub (`confirm_writeback=False` always), so it is safe to run unattended in CI. See [`examples/github-actions-gate.yml`](examples/github-actions-gate.yml) for a small conceptual GitHub Actions workflow example — it is not wired into this repository's own Actions.
+
+---
+
 ## Project Structure
 
 ```
@@ -295,6 +317,7 @@ changeguard-datahub/
 ├── demo.py                         # CLI demo (Demo mode, no dependencies)
 ├── contract_sentinel/
 │   ├── __init__.py                 # Package exports
+│   ├── cli.py                      # CI/CD gate CLI (0=ALLOW, 1=BLOCK, 2=ERROR)
 │   ├── agent.py                    # Autonomous 8-step agent pipeline
 │   ├── risk.py                     # Transparent risk scoring engine
 │   ├── report.py                   # Markdown report generator
@@ -304,6 +327,7 @@ changeguard-datahub/
 │   └── datahub_writeback.py        # Persists decisions as DataHub custom properties (SDK, not MCP)
 ├── tests/
 │   ├── test_agent.py                # Agent pipeline + real MCP response-shape tests
+│   ├── test_cli.py                  # CI/CD gate CLI tests (exit codes, JSON, no duplicated engine)
 │   ├── test_risk.py                # Risk scoring tests
 │   ├── test_report.py              # Report generation tests
 │   ├── test_datahub_mcp.py         # MCP adapter tests (incl. optional save_document)
@@ -312,7 +336,8 @@ changeguard-datahub/
 │   ├── changeguard-impact-report.md   # Sample agent output (Demo mode)
 │   ├── rename_allow_live.md           # Verified Live scenario: ALLOW
 │   ├── drop_block_live.md             # Verified Live scenario: BLOCK
-│   └── datahub-mcp.example.json       # MCP server config template
+│   ├── datahub-mcp.example.json       # MCP server config template
+│   └── github-actions-gate.yml        # Conceptual CI/CD gate workflow example
 ├── requirements.txt
 ├── LICENSE                         # Apache 2.0
 └── README.md
@@ -382,7 +407,7 @@ See the full output: [`examples/changeguard-impact-report.md`](examples/changegu
 - `save_document` writeback depends on the target DataHub instance already having at least one document in its catalog, or being configured to expose the tool regardless; ChangeGuard detects this at connect time and skips that step with a clear reason rather than failing.
 - The agent requires `get_entities`, `list_schema_fields`, and `get_lineage_paths_between` to be advertised by the MCP server to connect, but does not currently call them — see [DataHub MCP Integration](#datahub-mcp-integration).
 - Ownership, criticality, and dashboard classification of downstream assets in Live mode are not yet sourced from DataHub — `critical` is always `false` and `owner` is always `"Unknown"` for Live-mode results, since the agent does not call the tools that would supply that data. This means the risk score's "critical asset" and "business dashboard" bonus factors never trigger in Live mode today (they only apply in Demo mode, where fixtures set `critical: true` on some assets).
-- There is no CI/CD gate mode: `demo.py` and the underlying agent do not translate a BLOCK decision into a distinct process exit code today, so this project cannot currently be wired into a pipeline as a pass/fail check without additional code.
+- The CI/CD gate (`contract_sentinel/cli.py`, see [CI/CD Gate](#cicd-gate) below) never writes back to DataHub — it always runs with `confirm_writeback=False`, so it is safe to run unattended, but it cannot be used to persist a decision the way the Streamlit UI can.
 - The decision-persistence writeback (custom properties) has been verified against a local DataHub OSS quickstart instance only, not against DataHub Cloud or a production deployment.
 
 ---

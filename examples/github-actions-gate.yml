@@ -1,0 +1,48 @@
+# Example: using ChangeGuard as a CI/CD gate in GitHub Actions.
+#
+# This is a conceptual example, not a workflow wired into this repository.
+# It shows how a schema-change PR could be evaluated with ChangeGuard's
+# CLI before merging: ALLOW (exit 0) lets the job continue, BLOCK (exit 1)
+# fails the job, and any execution/configuration error (exit 2) also
+# fails the job so a broken check never silently passes.
+#
+# See contract_sentinel/cli.py and the "CI/CD Gate" section of README.md
+# for the full exit-code contract (0=ALLOW, 1=BLOCK, 2=ERROR).
+
+name: ChangeGuard Gate
+
+on:
+  pull_request:
+    paths:
+      - "migrations/**"
+
+jobs:
+  changeguard-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Evaluate proposed schema change with ChangeGuard
+        # A real workflow would derive --dataset/--column/--operation from
+        # the PR's migration file instead of hardcoding them here.
+        run: |
+          python -m contract_sentinel.cli \
+            --dataset commerce.orders \
+            --column customer_id \
+            --operation drop \
+            --mode live \
+            --datahub-url ${{ secrets.DATAHUB_GMS_URL }} \
+            --datahub-token ${{ secrets.DATAHUB_TOKEN }} \
+            --json
+        # Exit code from this step becomes the job's outcome directly:
+        #   0 (ALLOW) -> step succeeds, job continues
+        #   1 (BLOCK) -> step fails, job fails, PR check is red
+        #   2 (ERROR) -> step fails, job fails (dataset/column not found,
+        #                DataHub unreachable, invalid arguments, etc.)

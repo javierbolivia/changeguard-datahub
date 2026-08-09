@@ -19,48 +19,55 @@ Schema changes (renaming a column, dropping a field, changing a type) routinely 
 ## Architecture: ChangeGuard → MCP → DataHub
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  PROPOSED SCHEMA CHANGE                       │
-│         rename commerce.orders.customer_id → cust_key        │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                 CHANGEGUARD AGENT (contract_sentinel/agent.py)│
-│                                                              │
-│  Step 1 → Parse & validate change                            │
-│  Step 2 → Resolve dataset URN in DataHub (search)            │
-│  Step 3 → Read DataHub Memory: last persisted decision       │
-│           (get_entities, best-effort, informational only)    │
-│  Step 4 → Fetch column-level downstream lineage (get_lineage)│
-│  Step 5 → Score risk (transparent rules, no LLM)             │
-│  Step 6 → Generate impact report with migration checklist    │
-│  Step 7 → Write report back to DataHub (save_document, opt.) │
-│  Step 8 → BLOCK or ALLOW deployment decision                 │
-│  Step 9 → Persist decision to DataHub (custom properties)    │
-│                                                              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │  MCP stdio (uvx mcp-server-datahub) for
-                           │  search/lineage; direct SDK/REST for writeback
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                 DataHub MCP Server (acryldata/mcp-server-datahub) │
-│                 search · get_lineage                           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │  HTTP (GMS API)
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                 DataHub (metadata catalog + lineage graph)    │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        PROPOSED SCHEMA CHANGE                        │
+│              rename commerce.orders.customer_id → cust_key          │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│              CHANGEGUARD AGENT (contract_sentinel/agent.py)          │
+│                                                                      │
+│  Step 1  → parse_change                                              │
+│  Step 2  → resolve_urn                                               │
+│  Step 3  → validate_schema                                           │
+│  Step 4  → fetch_previous_context                                    │
+│  Step 5  → fetch_lineage                                             │
+│  Step 6  → fetch_potential_downstream                                │
+│  Step 7  → assess_risk                                               │
+│  Step 8  → generate_report                                           │
+│  Step 9  → writeback                                                 │
+│  Step 10 → decision                                                  │
+│  Step 11 → persist_decision                                          │
+│                                                                      │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │  MCP stdio (uvx mcp-server-datahub)
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│              DataHub MCP Server (acryldata/mcp-server-datahub)       │
+│  search · list_schema_fields · get_entities · get_lineage            │
+│  save_document (optional, when advertised and explicitly confirmed)  │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │  HTTP (GMS API)
+                                ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                 DataHub (metadata catalog + lineage graph)           │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-In Live mode, reads (search, lineage) go through the official, open-source
+In Live mode, DataHub reads go through the official, open-source
 **`mcp-server-datahub`** package (https://github.com/acryldata/mcp-server-datahub),
-launched as a local subprocess over stdio via `uvx`. The optional
-decision-persistence step (Step 8) does not go through MCP — it uses the
-official `acryl-datahub` Python SDK's REST emitter directly against
-DataHub's GMS API, because it does not depend on the MCP `save_document`
-tool being available (see [DataHub Writeback](#datahub-writeback) below).
+launched as a local subprocess over stdio via `uvx`. `search` resolves the
+dataset, `list_schema_fields` validates the schema, `get_entities` reads the
+last persisted ChangeGuard context, and `get_lineage` supplies both confirmed
+column impact and informational table-level propagation. Step 9 can use the
+optional `save_document` tool to write the Markdown report when that tool is
+advertised and writeback is explicitly confirmed.
+
+Step 11, custom-property decision persistence, does **not** use MCP or
+`save_document`. It uses the official `acryl-datahub` Python SDK's REST
+emitter directly against DataHub's GMS API (see
+[DataHub Writeback](#datahub-writeback) below).
 
 ---
 
@@ -358,7 +365,7 @@ changeguard-datahub/
 ├── contract_sentinel/
 │   ├── __init__.py                 # Package exports
 │   ├── cli.py                      # CI/CD gate CLI (0=ALLOW, 1=BLOCK, 2=ERROR)
-│   ├── agent.py                    # Autonomous 8-step agent pipeline
+│   ├── agent.py                    # Autonomous 11-step agent pipeline
 │   ├── risk.py                     # Transparent risk scoring engine
 │   ├── report.py                   # Markdown report generator
 │   ├── fixtures.py                 # Reproducible demo metadata
@@ -443,13 +450,17 @@ See the full output: [`examples/changeguard-impact-report.md`](examples/changegu
 ## Limitations
 
 - The public Streamlit Cloud deployment only supports Demo mode (see above) — it cannot reach a DataHub instance on your local machine.
-- Live mode's `resolve_urn` step falls back to a constructed URN (naming-convention guess) only if `search` returns zero results while otherwise succeeding; a hard connection or tool-call failure never falls back to any guess or fixture data, it surfaces the real error and stops.
+- Live mode stops with a clear error when `search` returns no matching dataset. It never constructs a guessed URN or substitutes fixture data for a missing dataset or a failed DataHub/MCP call.
+- DataHub Memory stores only the last persisted ChangeGuard decision. Custom properties are overwritten on each writeback, so this is not a historical audit trail.
 - `save_document` writeback depends on the target DataHub instance already having at least one document in its catalog, or being configured to expose the tool regardless; ChangeGuard detects this at connect time and skips that step with a clear reason rather than failing.
 - The agent requires `get_lineage_paths_between` to be advertised by the MCP server to connect, but does not currently call it — see [DataHub MCP Integration](#datahub-mcp-integration).
 - `get_entities` does not return `ownership`, `domain`, or `tags` in the current `mcp-server-datahub` response shape, and our seeded local DataHub instance has none of these set on any dataset either (confirmed directly via DataHub's GraphQL API during investigation). ChangeGuard therefore does not display ownership/domain/tags for Live-mode assets — see [DataHub Memory](#datahub-memory) for what `get_entities` is used for instead.
 - Ownership, criticality, and dashboard classification of downstream assets in Live mode are not yet sourced from DataHub — `critical` is always `false` and `owner` is always `"Unknown"` for Live-mode results, since the agent does not call the tools that would supply that data. This means the risk score's "critical asset" and "business dashboard" bonus factors never trigger in Live mode today (they only apply in Demo mode, where fixtures set `critical: true` on some assets).
+- Potential downstream propagation depends on table-level `get_lineage`. An incomplete table-level graph can omit potential assets, and this informational call has been observed to time out intermittently on the local development machine; its failure does not block scoring or the final decision.
+- On Windows, a Live CLI run may emit an `asyncio`/`ResourceWarning` during interpreter shutdown after the result has already been printed. The warning does not change the result or exit code.
 - The CI/CD gate (`contract_sentinel/cli.py`, see [CI/CD Gate](#cicd-gate) below) never writes back to DataHub — it always runs with `confirm_writeback=False`, so it is safe to run unattended, but it cannot be used to persist a decision the way the Streamlit UI can.
 - The decision-persistence writeback (custom properties) has been verified against a local DataHub OSS quickstart instance only, not against DataHub Cloud or a production deployment.
+- There is no Slack or Jira integration, and no LLM is used anywhere in the decision pipeline.
 
 ---
 

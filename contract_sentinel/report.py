@@ -15,6 +15,8 @@ def render_markdown(
     previous_context: PersistedContext | None = None,
     remediation: RemediationPlan | None = None,
     warnings: list[str] | None = None,
+    decision: str | None = None,
+    decision_reason: str | None = None,
 ) -> str:
     potential_assets = potential_assets or []
     warnings = warnings or []
@@ -24,9 +26,12 @@ def render_markdown(
         f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         f"Change: `{change.operation}` on `{change.dataset}.{change.column}`",
         f"Risk: **{impact.score}/100 — {impact.severity.upper()}**",
-        "",
-        "## Why this was flagged",
     ]
+    if decision is not None:
+        lines.append(f"Decision: **{decision}**")
+    if decision_reason:
+        lines.extend(["", "## Evidence sufficiency", decision_reason])
+    lines.extend(["", "## Why this was flagged"])
     lines.extend(f"- {reason}" for reason in impact.reasons)
     if warnings:
         lines.extend(["", "## Partial analysis warnings"])

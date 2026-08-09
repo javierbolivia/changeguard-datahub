@@ -30,7 +30,7 @@ class DataHubMCPAdapter:
     }
 
     # Tools that enhance the flow but are not required to analyze a change
-    # and produce a BLOCK/ALLOW decision. ``save_document`` is a Document
+    # and produce a BLOCK/ALLOW/REVIEW decision. ``save_document`` is a Document
     # Tool (not a Mutation Tool) and mcp-server-datahub automatically hides
     # it when no documents exist yet in the catalog, so its absence must
     # not prevent connecting in Live mode.
@@ -134,4 +134,3 @@ class DataHubMCPAdapter:
                 "related_assets": related_assets,
             },
         )
-

@@ -165,7 +165,7 @@ with st.sidebar:
         value=False,
         help=(
             "If checked and in Live mode, writes the ChangeGuard decision "
-            "(ALLOW/BLOCK, score, severity, operation, column, timestamp) "
+            "(ALLOW/BLOCK/REVIEW, score, severity, operation, column, timestamp) "
             "as custom properties on the dataset in DataHub."
         ),
     )
@@ -216,7 +216,7 @@ proposes a schema change (rename, drop, type change), the agent:
 4. **Scores** risk using transparent, reproducible rules (no LLM black box)
 5. **Generates** a structured impact report with migration checklist
 6. **Writes back** the decision to DataHub so the team inherits context
-7. **Decides** to BLOCK or ALLOW the deployment
+7. **Decides** to BLOCK, ALLOW, or require REVIEW for insufficient evidence
 
 The agent uses these DataHub MCP Server tools:
 - `search` — find the dataset by name
@@ -242,9 +242,10 @@ The agent uses these DataHub MCP Server tools:
 
 **Severity thresholds:** Critical ≥80, High ≥60, Medium ≥30, Low <30
 
-**Deployment decision:** Critical/High → BLOCK. Medium/Low → ALLOW
-(change may proceed, but review the reasons and checklist — Medium
-severity is not risk-free, it is simply not blocked).
+**Deployment decision:** Critical/High → BLOCK. Medium/Low → ALLOW when
+evidence is sufficient. In Live mode, destructive changes with zero confirmed
+column-level consumers require REVIEW because an empty result alone cannot
+establish complete lineage coverage.
 """
         )
     st.stop()
@@ -415,17 +416,28 @@ if result.impact:
     col4.metric("Mode", result.mode.upper())
 
     # Decision banner
-    if result.impact.severity in {"critical", "high"}:
+    if result.decision == "BLOCK":
         st.error(
             f"\U0001f6d1 **DEPLOYMENT BLOCKED** — Risk score {result.impact.score}/100. "
             f"Complete the migration checklist before proceeding."
         )
-    else:
+    elif result.decision == "REVIEW":
+        st.warning(
+            "⚠️ **REVIEW REQUIRED — INSUFFICIENT EVIDENCE**\n\n"
+            "Insufficient evidence to safely issue ALLOW. DataHub returned no "
+            "confirmed column-level consumers; ChangeGuard cannot distinguish "
+            "a truly isolated column from incomplete catalog or lineage coverage."
+        )
+        if result.decision_reason:
+            st.caption(result.decision_reason)
+    elif result.decision == "ALLOW":
         st.success(
             f"\u2705 **CHANGE ALLOWED** — Risk score {result.impact.score}/100 "
             f"({result.impact.severity}). Not blocked, but review the reasons "
             f"and checklist below before deploying."
         )
+    else:
+        st.error("ChangeGuard did not complete a deployment decision.")
 
     for warning in result.warnings:
         st.warning(f"\u26a0\ufe0f **Partial analysis:** {warning}")
@@ -465,7 +477,10 @@ if result.impact:
 
     with tab_blast:
         st.markdown("**\u2705 CONFIRMED COLUMN IMPACT**")
-        st.caption("DataHub shows a confirmed column-level lineage dependency.")
+        if result.downstream_assets:
+            st.caption("DataHub shows a confirmed column-level lineage dependency.")
+        else:
+            st.caption("DataHub returned no confirmed column-level consumers.")
         for asset in result.downstream_assets:
             with st.expander(
                 f"**{asset['name']}** · {asset['kind']} · Owner: {asset['owner']}",
@@ -500,7 +515,10 @@ if result.impact:
 
     with tab_remediation:
         if result.remediation is not None:
-            if result.remediation.required:
+            if result.decision == "REVIEW":
+                st.warning("⚠️ **REVIEW REQUIRED — INSUFFICIENT EVIDENCE**")
+                st.markdown("### Evidence verification steps")
+            elif result.remediation.required:
                 st.error("\U0001f6d1 **BLOCKED**")
                 st.markdown("### Recommended path to re-evaluation")
             else:

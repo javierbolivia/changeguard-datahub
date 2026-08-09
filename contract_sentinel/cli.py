@@ -3,7 +3,7 @@
 This is a thin wrapper around the same ``ChangeGuardAgent`` and
 ``create_live_adapter`` used by the Streamlit app (see ``app.py``'s
 ``execute_agent()``). It does not reimplement risk scoring, lineage
-fetching, schema validation, or the ALLOW/BLOCK decision — it only:
+fetching, schema validation, or the ALLOW/BLOCK/REVIEW decision — it only:
 
 1. Parses CLI arguments into a ``Change``
 2. Builds the same live MCP adapter (or none, for demo mode)
@@ -17,6 +17,7 @@ Exit codes:
     1 = BLOCK
     2 = execution/configuration error (dataset not found, column not
         found, DataHub/MCP unreachable, invalid CLI arguments, etc.)
+    3 = REVIEW (insufficient evidence to safely issue ALLOW)
 
 Usage:
     python -m contract_sentinel.cli \\
@@ -47,6 +48,7 @@ from .risk import Change
 EXIT_ALLOW = 0
 EXIT_BLOCK = 1
 EXIT_ERROR = 2
+EXIT_REVIEW = 3
 
 
 class _ArgumentParseError(ValueError):
@@ -64,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "ChangeGuard CI/CD gate: evaluate a proposed schema change "
             "against DataHub lineage and exit with a CI-friendly code "
-            "(0=ALLOW, 1=BLOCK, 2=ERROR)."
+            "(0=ALLOW, 1=BLOCK, 2=ERROR, 3=REVIEW)."
         ),
     )
     parser.add_argument(
@@ -141,8 +143,10 @@ def _human_report(args: argparse.Namespace, result: AgentResult, decision: str) 
         f"Confirmed affected assets: {len(result.downstream_assets)}",
         f"Potential downstream assets: {len(result.potential_downstream_assets)}",
         f"Decision: {decision}",
-        "Reasons:",
     ]
+    if result.decision_reason:
+        lines.extend(["Evidence Sufficiency:", f"- {result.decision_reason}"])
+    lines.append("Reasons:")
     lines.extend(f"- {reason}" for reason in impact.reasons)
     lines.append("Confirmed:")
     lines.extend(f"- {asset['name']}" for asset in result.downstream_assets)
@@ -170,6 +174,7 @@ def _json_report(args: argparse.Namespace, result: AgentResult, decision: str) -
         "risk_score": impact.score,
         "severity": impact.severity,
         "decision": decision,
+        "decision_reason": result.decision_reason,
         "confirmed_affected_assets": len(result.downstream_assets),
         "potential_downstream_assets": len(result.potential_downstream_assets),
         "mode": result.mode,
@@ -269,12 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     decision_step = next((s for s in result.steps if s.name == "decision"), None)
-    decision = (
-        decision_step.result.get("decision")
-        if decision_step and isinstance(decision_step.result, dict)
-        else None
-    )
-    if decision not in {"ALLOW", "BLOCK"}:
+    decision = result.decision
+    if (
+        decision_step is None
+        or decision_step.status != StepStatus.SUCCESS
+        or decision not in {"ALLOW", "BLOCK", "REVIEW"}
+    ):
         _emit_error("ChangeGuard could not determine a deployment decision.", args)
         return EXIT_ERROR
 
@@ -283,7 +288,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(_human_report(args, result, decision))
 
-    return EXIT_ALLOW if decision == "ALLOW" else EXIT_BLOCK
+    return {
+        "ALLOW": EXIT_ALLOW,
+        "BLOCK": EXIT_BLOCK,
+        "REVIEW": EXIT_REVIEW,
+    }[decision]
 
 
 if __name__ == "__main__":

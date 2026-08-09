@@ -33,6 +33,7 @@ from .risk import Change, Impact, assess_change
 # contract_sentinel.datahub_writeback.write_decision_to_datahub bound with
 # its connection args via functools.partial. Kept as a plain Callable so
 # the agent has no import-time dependency on the DataHub SDK.
+# The first argument is the exact dataset URN resolved for this run.
 WritebackFn = Callable[[str, str, int, str, str, str], Any]
 
 
@@ -64,6 +65,8 @@ class AgentResult:
     change: Change
     steps: list[AgentStep] = field(default_factory=list)
     impact: Impact | None = None
+    decision: str | None = None
+    decision_reason: str | None = None
     remediation: RemediationPlan | None = None
     report: str | None = None
     downstream_assets: list[dict] = field(default_factory=list)
@@ -178,19 +181,8 @@ class ChangeGuardAgent:
                 # mcp-server-datahub returns results nested as
                 # {"searchResults": [{"entity": {"urn": ..., ...}}, ...]}
                 entities = search_result.get("searchResults", [])
-                if entities:
-                    dataset_urn = entities[0].get("entity", {}).get("urn")
-                    step2.result = {"urn": dataset_urn, "source": "datahub_search"}
-                else:
-                    # Live mode: never guess a URN for a dataset DataHub
-                    # does not know about. Stop the analysis outright so a
-                    # nonexistent dataset can never produce a risk score,
-                    # an ALLOW/BLOCK decision, or a writeback.
-                    step2.status = StepStatus.FAILED
-                    step2.error = f"Dataset not found in DataHub: {change.dataset}"
-                    step2.duration_ms = (time.perf_counter() - t0) * 1000
-                    self._emit(step2)
-                    return result
+                dataset_urn = _resolve_exact_dataset_urn(entities, change.dataset)
+                step2.result = {"urn": dataset_urn, "source": "datahub_search"}
             else:
                 # Demo mode: construct URN from naming convention
                 dataset_urn = f"urn:li:dataset:(urn:li:dataPlatform:snowflake,{change.dataset},PROD)"
@@ -235,7 +227,17 @@ class ChangeGuardAgent:
                     f.get("fieldPath") for f in schema_result.get("fields", [])
                 }
 
-                if change.column not in field_names:
+                if change.operation == "add":
+                    if change.column in field_names:
+                        step2b.status = StepStatus.FAILED
+                        step2b.error = (
+                            f"Cannot add '{change.column}' to dataset "
+                            f"'{change.dataset}': column already exists."
+                        )
+                        step2b.duration_ms = (time.perf_counter() - t0) * 1000
+                        self._emit(step2b)
+                        return result
+                elif change.column not in field_names:
                     step2b.status = StepStatus.FAILED
                     step2b.error = (
                         f"Column '{change.column}' was not found in dataset "
@@ -311,7 +313,7 @@ class ChangeGuardAgent:
             except Exception as e:
                 # Best-effort only: DataHub Memory is context, not a
                 # requirement. A failure here must never break schema
-                # validation, lineage, or the ALLOW/BLOCK decision.
+                # validation, lineage, or the ALLOW/BLOCK/REVIEW decision.
                 step2c.status = StepStatus.FAILED
                 step2c.error = str(e)
                 step2c.duration_ms = (time.perf_counter() - t0) * 1000
@@ -341,8 +343,13 @@ class ChangeGuardAgent:
                 # mcp-server-datahub returns downstream lineage nested as
                 # {"downstreams": {"searchResults": [{"entity": {...}, ...}]}}
                 raw_assets = lineage_data.get("downstreams", {}).get("searchResults", [])
+                seen_confirmed: set[tuple[Any, ...]] = set()
                 for item in raw_assets:
                     entity = item.get("entity", {})
+                    identity = _confirmed_lineage_identity(item, entity)
+                    if identity in seen_confirmed:
+                        continue
+                    seen_confirmed.add(identity)
                     urn = entity.get("urn", "")
                     name = entity.get("name") or entity.get("properties", {}).get(
                         "name", urn or "Unknown"
@@ -493,6 +500,28 @@ class ChangeGuardAgent:
         # It uses only the current assessment and the already-fetched lineage
         # sets; previous DataHub context is deliberately not an input.
         decision = "BLOCK" if impact.severity in {"critical", "high"} else "ALLOW"
+        decision_reason = None
+        if (
+            self._mcp
+            and decision == "ALLOW"
+            and change.operation in {"drop", "rename", "type_change"}
+            and not downstream
+        ):
+            decision = "REVIEW"
+            if result.potential_downstream_assets:
+                decision_reason = (
+                    "Insufficient confirmed column-level evidence to safely issue "
+                    "ALLOW. DataHub returned no confirmed column-level consumers; "
+                    "table-level potential downstream propagation exists, but "
+                    "column-level impact is not confirmed."
+                )
+            else:
+                decision_reason = (
+                    "Insufficient confirmed column-level evidence to safely issue "
+                    "ALLOW. DataHub returned no confirmed column-level consumers. "
+                    "ChangeGuard cannot distinguish a truly isolated column from "
+                    "incomplete catalog or lineage coverage."
+                )
         result.remediation = build_remediation_plan(
             change=change,
             severity=impact.severity,
@@ -520,6 +549,8 @@ class ChangeGuardAgent:
                 previous_context=result.previous_context,
                 remediation=result.remediation,
                 warnings=result.warnings,
+                decision=decision,
+                decision_reason=decision_reason,
             )
             result.report = report
             step5.result = {"report_length": len(report), "has_checklist": True}
@@ -592,6 +623,8 @@ class ChangeGuardAgent:
         self._emit(step7)
         t0 = time.perf_counter()
 
+        result.decision = decision
+        result.decision_reason = decision_reason
         step7.result = {
             "decision": decision,
             "severity": impact.severity,
@@ -599,7 +632,11 @@ class ChangeGuardAgent:
                 f"Deployment BLOCKED — risk score {impact.score}/100 ({impact.severity}). "
                 f"Complete the migration checklist before proceeding."
                 if decision == "BLOCK"
-                else f"Change may proceed — risk score {impact.score}/100 ({impact.severity})."
+                else (
+                    f"REVIEW REQUIRED — {decision_reason}"
+                    if decision == "REVIEW"
+                    else f"Change may proceed — risk score {impact.score}/100 ({impact.severity})."
+                )
             ),
         }
         step7.status = StepStatus.SUCCESS
@@ -630,7 +667,7 @@ class ChangeGuardAgent:
         else:
             try:
                 record = self._writeback_fn(
-                    change.dataset,
+                    dataset_urn,
                     decision,
                     impact.score,
                     impact.severity,
@@ -662,3 +699,79 @@ def _classify_asset(asset: dict) -> str:
     if "dataflow" in urn or "datajob" in urn:
         return "pipeline"
     return "dataset"
+
+
+def _resolve_exact_dataset_urn(search_results: Any, dataset_name: str) -> str:
+    """Resolve one exact dataset identity from a fuzzy DataHub search result.
+
+    Repeated rows for the same URN are harmless, but distinct exact matches
+    across platforms or environments are ambiguous and must never be guessed.
+    """
+    if not isinstance(search_results, list) or not search_results:
+        raise ValueError(f"Dataset not found in DataHub: {dataset_name}")
+
+    exact_urns: set[str] = set()
+    malformed_exact = False
+    for item in search_results:
+        if not isinstance(item, dict):
+            continue
+        entity = item.get("entity")
+        if not isinstance(entity, dict):
+            continue
+        if _dataset_name_from_entity(entity) != dataset_name:
+            continue
+        urn = entity.get("urn")
+        if not isinstance(urn, str) or not urn:
+            malformed_exact = True
+            continue
+        exact_urns.add(urn)
+
+    if malformed_exact:
+        raise ValueError(
+            f"Exact DataHub match for '{dataset_name}' is malformed: missing URN."
+        )
+    if not exact_urns:
+        raise ValueError(f"No exact dataset match found in DataHub: {dataset_name}")
+    if len(exact_urns) > 1:
+        raise ValueError(
+            f"Ambiguous DataHub dataset '{dataset_name}': found multiple exact "
+            "matches across platforms or environments."
+        )
+    return next(iter(exact_urns))
+
+
+def _dataset_name_from_entity(entity: dict) -> str | None:
+    name = entity.get("name")
+    if not name and isinstance(entity.get("properties"), dict):
+        name = entity["properties"].get("name")
+    if isinstance(name, str) and name:
+        return name
+
+    urn = entity.get("urn")
+    if not isinstance(urn, str):
+        return None
+    prefix = "urn:li:dataset:("
+    if not urn.startswith(prefix) or not urn.endswith(")"):
+        return None
+    components = urn[len(prefix) : -1].rsplit(",", 2)
+    return components[1] if len(components) == 3 else None
+
+
+def _confirmed_lineage_identity(item: dict, entity: dict) -> tuple[Any, ...]:
+    """Return a stable identity for one confirmed column dependency."""
+    urn = entity.get("urn")
+    raw_columns = item.get("lineageColumns", [])
+    columns = (
+        tuple(sorted({str(column) for column in raw_columns}))
+        if isinstance(raw_columns, list)
+        else ()
+    )
+    if isinstance(urn, str) and urn:
+        return ("urn", urn, "columns", columns)
+
+    name = entity.get("name") or (
+        entity.get("properties", {}).get("name")
+        if isinstance(entity.get("properties"), dict)
+        else None
+    )
+    return ("name", str(name or "Unknown"), "columns", columns)

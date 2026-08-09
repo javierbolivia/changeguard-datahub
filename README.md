@@ -2,9 +2,9 @@
 
 ![ChangeGuard](assets/changeguard-thumbnail.png)
 
-**ChangeGuard** is a deterministic pre-deployment schema change gate. It reads DataHub lineage through the official DataHub MCP Server, separates confirmed column-level impact from potential table-level propagation, scores risk with transparent policy rules, and produces an ALLOW/BLOCK decision with remediation recommendations.
+**ChangeGuard** is a deterministic pre-deployment schema change gate. It reads DataHub lineage through the official DataHub MCP Server, separates confirmed column-level impact from potential table-level propagation, scores risk with transparent policy rules, and produces an ALLOW, BLOCK, or evidence-sufficiency REVIEW decision with remediation recommendations.
 
-> ChangeGuard turns DataHub lineage into a pre-deployment ALLOW/BLOCK gate, with evidence-aware blast radius and remediation before schemas break production.
+> ChangeGuard turns DataHub lineage into a pre-deployment ALLOW/BLOCK/REVIEW gate, with evidence-aware blast radius and remediation before schemas break production.
 
 Built for **[Build with DataHub: The Agent Hackathon](https://datahub.devpost.com/)** — Category: *Agents That Do Real Work*.
 
@@ -14,7 +14,14 @@ Built for **[Build with DataHub: The Agent Hackathon](https://datahub.devpost.co
 
 ## What ChangeGuard Does
 
-Schema changes (renaming a column, dropping a field, changing a type) can break dashboards, downstream tables, and ML pipelines when their downstream evidence is not reviewed before deployment. Given a proposed change, ChangeGuard asks DataHub for the available lineage evidence, applies visible and reproducible policy rules, and returns an ALLOW/BLOCK gate decision for engineering review.
+Schema changes (renaming a column, dropping a field, changing a type) can break dashboards, downstream tables, and ML pipelines when their downstream evidence is not reviewed before deployment. Given a proposed change, ChangeGuard asks DataHub for the available lineage evidence, applies visible and reproducible policy rules, and returns an ALLOW/BLOCK/REVIEW gate decision for engineering review.
+
+For Live DROP, RENAME, and TYPE_CHANGE operations, a successful column-level
+lineage query with zero confirmed consumers produces **REVIEW — INSUFFICIENT
+EVIDENCE**, not ALLOW. An empty result alone cannot prove complete catalog or
+lineage coverage. REVIEW is not an execution error and does not assert that the
+change is dangerous; it requires evidence verification before deployment.
+ADD retains its existing deterministic policy and is not automatically REVIEW.
 
 ---
 
@@ -99,7 +106,7 @@ turns it into a repeatable pre-deployment check:
   does not maintain its own copy of the graph.
 - **ChangeGuard turns that graph into a policy decision.** Given one
   proposed change, it applies the same transparent scoring rules every
-  time and produces exactly one of two outcomes: `ALLOW` or `BLOCK`. This
+  time and produces one of three outcomes: `ALLOW`, `BLOCK`, or `REVIEW`. This
   is deterministic and reproducible for the same proposed change, metadata
   evidence, and policy configuration (see [Risk Scoring Transparency](#risk-scoring-transparency)).
 - **The decision is automatable, not just a dashboard view.** Because the
@@ -108,7 +115,7 @@ turns it into a repeatable pre-deployment check:
   Streamlit UI can be called from a script — see
   [`demo.py`](demo.py) for the CLI form of this.
 - **It can persist the latest decision context.** Optionally (with
-  explicit confirmation), the decision — ALLOW/BLOCK, score, severity,
+  explicit confirmation), the decision — ALLOW/BLOCK/REVIEW, score, severity,
   operation, column, timestamp — is written back onto the dataset in
   DataHub as custom properties, so the next person or agent inspecting
   that dataset can see the latest persisted evaluation. A later execution
@@ -364,7 +371,7 @@ best-effort step (`fetch_previous_context`).
   input to the current score.
 - If `get_entities` fails or DataHub is briefly unreachable, this step is
   marked `FAILED` but does not block schema validation, lineage, or the
-  ALLOW/BLOCK decision — DataHub Memory is best-effort by design.
+  ALLOW/BLOCK/REVIEW decision — DataHub Memory is best-effort by design.
 
 ---
 
@@ -385,8 +392,9 @@ python -m contract_sentinel.cli \
 - **exit 0** = `ALLOW`
 - **exit 1** = `BLOCK`
 - **exit 2** = execution/configuration error (dataset not found, column not found, DataHub/MCP unreachable, invalid arguments)
+- **exit 3** = `REVIEW` (insufficient evidence to safely issue ALLOW)
 
-The CLI never writes back to DataHub (`confirm_writeback=False` always), so it is safe to run unattended in CI. See [`examples/github-actions-gate.yml`](examples/github-actions-gate.yml) for a small conceptual GitHub Actions workflow example. The example installs `uv`/`uvx`, labels BLOCK separately from execution ERROR, and still fails the job for either outcome; it is not wired into this repository's own Actions.
+The CLI never writes back to DataHub (`confirm_writeback=False` always), so it is safe to run unattended in CI. See [`examples/github-actions-gate.yml`](examples/github-actions-gate.yml) for a small conceptual GitHub Actions workflow example. The example installs `uv`/`uvx`, labels BLOCK, ERROR, and REVIEW separately, and stops the job for all three non-ALLOW outcomes; it is not wired into this repository's own Actions.
 
 ---
 
@@ -398,7 +406,7 @@ changeguard-datahub/
 ├── demo.py                         # CLI demo (Demo mode, no dependencies)
 ├── contract_sentinel/
 │   ├── __init__.py                 # Package exports
-│   ├── cli.py                      # CI-compatible gate CLI (0=ALLOW, 1=BLOCK, 2=ERROR)
+│   ├── cli.py                      # CI gate CLI (0=ALLOW, 1=BLOCK, 2=ERROR, 3=REVIEW)
 │   ├── agent.py                    # Deterministic 11-step agentic workflow
 │   ├── remediation.py              # Deterministic remediation plan rules
 │   ├── risk.py                     # Transparent risk scoring engine
@@ -443,12 +451,13 @@ ChangeGuard uses **deterministic, explainable rules** instead of opaque LLM judg
 
 **Severity thresholds:** Critical (≥80) | High (≥60) | Medium (≥30) | Low (<30)
 
-**Deployment decision:** the gate outputs `BLOCK` or `ALLOW`; best-effort
-metadata failures may additionally be surfaced as warnings without becoming a
-third gate decision. Critical and High severity → **BLOCK** and require
-remediation followed by re-evaluation. Medium and Low severity → **ALLOW**,
-meaning the policy does not block the change, not that the change is guaranteed
-safe. Review the evidence and recommendations before deployment.
+**Deployment decision:** Critical and High severity → **BLOCK** and require
+remediation followed by re-evaluation. Medium and Low severity → **ALLOW** when
+the evidence-sufficiency rule permits it. In Live mode, DROP, RENAME, and
+TYPE_CHANGE with zero confirmed column-level consumers → **REVIEW**, regardless
+of whether table-level Potential lineage is empty. REVIEW is an evidence
+override, not a score threshold; Potential assets remain informational and are
+not scored. ADD is not automatically REVIEW.
 
 ---
 

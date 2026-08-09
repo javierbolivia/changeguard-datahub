@@ -1,6 +1,6 @@
 """Persistent writeback of ChangeGuard decisions to DataHub.
 
-This module writes a ChangeGuard decision (ALLOW/BLOCK, risk score,
+This module writes a ChangeGuard decision (ALLOW/BLOCK/REVIEW, risk score,
 severity, operation, column, timestamp) as custom properties on the
 analyzed dataset, using the official DataHub Python SDK's REST emitter
 and ``DatasetPatchBuilder``.
@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from datahub.emitter.mce_builder import make_dataset_urn
 from datahub.emitter.rest_emitter import DatahubRestEmitter
 from datahub.specific.dataset import DatasetPatchBuilder
 
@@ -160,14 +159,12 @@ def parse_persisted_context(get_entities_response: Any) -> PersistedContext | No
 
 def write_decision_to_datahub(
     datahub_url: str,
-    dataset_name: str,
+    dataset_urn: str,
     decision: str,
     risk_score: int,
     severity: str,
     operation: str,
     column: str,
-    platform: str = "snowflake",
-    env: str = "PROD",
     datahub_token: str | None = None,
 ) -> WritebackRecord:
     """Persist a ChangeGuard decision as custom properties on a dataset.
@@ -181,7 +178,6 @@ def write_decision_to_datahub(
     connection errors); callers are expected to require explicit user
     confirmation before invoking this function, since it mutates DataHub.
     """
-    dataset_urn = make_dataset_urn(platform, dataset_name, env)
     properties = build_writeback_properties(
         decision, risk_score, severity, operation, column
     )

@@ -3,11 +3,11 @@
 # This is a conceptual example, not a workflow wired into this repository.
 # It shows how a schema-change PR could be evaluated with ChangeGuard's
 # CLI before merging: ALLOW (exit 0) lets the job continue, BLOCK (exit 1)
-# fails the job, and any execution/configuration error (exit 2) also
-# fails the job so a broken check never silently passes.
+# fails the job, any execution/configuration error (exit 2) also fails,
+# and REVIEW (exit 3) stops deployment pending evidence verification.
 #
 # See contract_sentinel/cli.py and the "CI/CD Gate" section of README.md
-# for the full exit-code contract (0=ALLOW, 1=BLOCK, 2=ERROR).
+# for the full exit-code contract (0=ALLOW, 1=BLOCK, 2=ERROR, 3=REVIEW).
 
 name: ChangeGuard Gate
 
@@ -60,11 +60,14 @@ jobs:
             2)
               echo "::error title=ChangeGuard ERROR::The gate could not complete its analysis."
               ;;
+            3)
+              echo "::warning title=ChangeGuard REVIEW::Insufficient evidence to safely issue ALLOW."
+              ;;
             *)
               echo "::error title=ChangeGuard ERROR::Unexpected exit code $changeguard_status."
               changeguard_status=2
               ;;
           esac
 
-          # BLOCK and ERROR still fail the step/job; only ALLOW continues.
+          # BLOCK, ERROR, and REVIEW fail the step/job; only ALLOW continues.
           exit "$changeguard_status"

@@ -190,6 +190,30 @@ class RemediationRuleTests(unittest.TestCase):
         self.assertEqual(plan.summary, "No blocking remediation required.")
         self.assertNotIn("blocked", plan.summary.casefold())
 
+    def test_review_has_deterministic_evidence_verification_guidance(self):
+        plan = build_remediation_plan(
+            Change("commerce.orders", "customer_id", "drop"),
+            "medium",
+            "REVIEW",
+            [],
+            POTENTIAL,
+        )
+
+        self.assertTrue(plan.required)
+        self.assertIn("Evidence verification is required", plan.summary)
+        self.assertIn("not mean the change is confirmed dangerous", plan.summary)
+        self.assertEqual(
+            [step.kind for step in plan.steps],
+            [
+                "coverage_verification",
+                "external_consumer_review",
+                "potential_review",
+                "re_evaluate",
+            ],
+        )
+        self.assertEqual(plan.steps[2].assets, ("analytics.sales_summary",))
+        self.assertIn("remain unconfirmed", plan.steps[2].detail)
+
 
 class RemediationAgentIntegrationTests(unittest.TestCase):
     TOOLS = {
@@ -203,7 +227,16 @@ class RemediationAgentIntegrationTests(unittest.TestCase):
     def _run(self, previous_context):
         async def caller(name, arguments):
             if name == "search":
-                return {"searchResults": [{"entity": {"urn": "urn:orders"}}]}
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
             if name == "list_schema_fields":
                 return {"fields": [{"fieldPath": "customer_id"}]}
             if name == "get_entities":
@@ -284,7 +317,16 @@ class RemediationAgentIntegrationTests(unittest.TestCase):
 
         async def caller(name, arguments):
             if name == "search":
-                return {"searchResults": [{"entity": {"urn": "urn:orders"}}]}
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
             if name == "list_schema_fields":
                 return {"fields": [{"fieldPath": "customer_id"}]}
             if name == "get_entities":

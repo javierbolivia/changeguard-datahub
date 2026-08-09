@@ -105,6 +105,45 @@ def _patched_live_adapter():
     return patch.object(cli, "create_live_adapter", fake_create_live_adapter)
 
 
+def _patched_zero_confirmed_adapter(include_potential=False):
+    async def caller(name, arguments):
+        if name == "search":
+            return {
+                "searchResults": [
+                    {
+                        "entity": {
+                            "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                            "properties": {"name": "commerce.orders"},
+                        }
+                    }
+                ]
+            }
+        if name == "list_schema_fields":
+            return {"fields": [{"fieldPath": "customer_id"}]}
+        if name == "get_entities":
+            return []
+        if name == "get_lineage" and "column" in arguments:
+            return {"downstreams": {"searchResults": []}}
+        if name == "get_lineage":
+            search_results = []
+            if include_potential:
+                search_results.append(
+                    {
+                        "entity": {
+                            "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.sales_summary,PROD)",
+                            "name": "analytics.sales_summary",
+                        }
+                    }
+                )
+            return {"downstreams": {"searchResults": search_results}}
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    async def fake_create_live_adapter(datahub_url, datahub_token=None):
+        return DataHubMCPAdapter(caller, TOOLS)
+
+    return patch.object(cli, "create_live_adapter", fake_create_live_adapter)
+
+
 def _run_cli(argv):
     """Run cli.main() capturing stdout, returning (exit_code, stdout)."""
     buf = io.StringIO()
@@ -157,6 +196,70 @@ class CliExitCodeTests(unittest.TestCase):
         self.assertIn("analytics.customer_orders", out)
         self.assertIn("analytics.sales_summary", out)
         self.assertIn("column-level impact is not confirmed", out)
+
+    def test_review_decision_exits_three(self):
+        with _patched_zero_confirmed_adapter(include_potential=True):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "drop",
+                    "--mode",
+                    "live",
+                ]
+            )
+
+        self.assertEqual(exit_code, cli.EXIT_REVIEW)
+        self.assertIn("Decision: REVIEW", out)
+        self.assertIn("Insufficient confirmed column-level evidence", out)
+        self.assertIn("analytics.sales_summary", out)
+
+    def test_ambiguous_dataset_resolution_is_error_not_review(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        },
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:bigquery,commerce.orders,DEV)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        },
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        async def ambiguous_adapter(datahub_url, datahub_token=None):
+            return DataHubMCPAdapter(caller, TOOLS)
+
+        with patch.object(cli, "create_live_adapter", ambiguous_adapter):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "drop",
+                    "--mode",
+                    "live",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_ERROR)
+        self.assertIn("Ambiguous", payload["error"])
+        self.assertNotEqual(payload.get("decision"), "REVIEW")
 
     def test_dataset_not_found_exits_two(self):
         with _patched_live_adapter():
@@ -329,6 +432,33 @@ class CliJsonOutputTests(unittest.TestCase):
         self.assertNotIn("blocked", payload["remediation"]["summary"].casefold())
         self.assertEqual(exit_code, cli.EXIT_ALLOW)
 
+    def test_json_review_is_machine_readable_and_exits_three(self):
+        with _patched_zero_confirmed_adapter(include_potential=True):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "rename",
+                    "--new-name",
+                    "cust_key",
+                    "--mode",
+                    "live",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_REVIEW)
+        self.assertEqual(payload["decision"], "REVIEW")
+        self.assertEqual(payload["risk_score"], 45)
+        self.assertEqual(payload["confirmed_affected_assets"], 0)
+        self.assertEqual(payload["potential_downstream_assets"], 1)
+        self.assertIn("Insufficient confirmed", payload["decision_reason"])
+        self.assertTrue(payload["remediation"]["required"])
+
     def test_json_unexpected_execution_error_is_valid_and_exits_two(self):
         async def failing_run(args):
             raise RuntimeError("unexpected agent failure")
@@ -435,6 +565,8 @@ class GithubActionsExampleTests(unittest.TestCase):
         self.assertIn('ChangeGuard BLOCK', workflow)
         self.assertIn('2)', workflow)
         self.assertIn('ChangeGuard ERROR', workflow)
+        self.assertIn('3)', workflow)
+        self.assertIn('ChangeGuard REVIEW', workflow)
         self.assertIn('exit "$changeguard_status"', workflow)
         self.assertNotIn("continue-on-error: true", workflow)
 

@@ -46,12 +46,62 @@ def build_remediation_plan(
     """
     if change.operation not in {"drop", "rename", "type_change", "add"}:
         raise ValueError(f"Unsupported remediation operation: {change.operation}")
-    if decision not in {"ALLOW", "BLOCK"}:
+    if decision not in {"ALLOW", "BLOCK", "REVIEW"}:
         raise ValueError(f"Unsupported ChangeGuard decision: {decision}")
 
     confirmed = _asset_names(confirmed_assets)
     potential = _asset_names(potential_assets)
-    required = decision == "BLOCK"
+    required = decision in {"BLOCK", "REVIEW"}
+
+    if decision == "REVIEW":
+        potential_detail = (
+            "Confirm whether these table-level potential dependencies use the "
+            f"changed column; they remain unconfirmed: {_join_names(potential)}."
+            if potential
+            else (
+                "Confirm whether any table-level or uncataloged dependencies use "
+                "the changed column; no potential assets were returned."
+            )
+        )
+        return RemediationPlan(
+            required=True,
+            summary=(
+                "Evidence verification is required before ChangeGuard can issue "
+                "ALLOW. REVIEW does not mean the change is confirmed dangerous."
+            ),
+            steps=(
+                RemediationAction(
+                    kind="coverage_verification",
+                    title="Verify lineage and catalog coverage",
+                    detail=(
+                        "Verify the available lineage and catalog coverage for "
+                        f"{change.dataset}.{change.column}."
+                    ),
+                ),
+                RemediationAction(
+                    kind="external_consumer_review",
+                    title="Check for consumers outside the catalog",
+                    detail=(
+                        "Check application, pipeline, and reporting consumers that "
+                        "may not be represented in DataHub."
+                    ),
+                ),
+                RemediationAction(
+                    kind="potential_review",
+                    title="Confirm potential dependency usage",
+                    detail=potential_detail,
+                    assets=potential,
+                ),
+                RemediationAction(
+                    kind="re_evaluate",
+                    title="Re-run ChangeGuard",
+                    detail=(
+                        "Re-run ChangeGuard after the evidence and coverage have "
+                        "been verified."
+                    ),
+                ),
+            ),
+        )
 
     if required:
         summary = (

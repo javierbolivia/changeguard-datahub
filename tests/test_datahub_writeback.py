@@ -1,8 +1,12 @@
 """Tests for the DataHub persistent writeback helper."""
 
 import unittest
+from unittest.mock import patch
 
-from contract_sentinel.datahub_writeback import build_writeback_properties
+from contract_sentinel.datahub_writeback import (
+    build_writeback_properties,
+    write_decision_to_datahub,
+)
 
 
 class WritebackPropertiesTests(unittest.TestCase):
@@ -47,6 +51,40 @@ class WritebackPropertiesTests(unittest.TestCase):
         self.assertTrue(props["changeguard_timestamp"])
         # ISO 8601 with a 'T' separator and timezone info.
         self.assertIn("T", props["changeguard_timestamp"])
+
+
+class ExactUrnWritebackTests(unittest.TestCase):
+    @patch("contract_sentinel.datahub_writeback.DatasetPatchBuilder")
+    @patch("contract_sentinel.datahub_writeback.DatahubRestEmitter")
+    def test_persistence_targets_the_exact_analyzed_urn(
+        self, emitter_cls, patch_builder_cls
+    ):
+        patch_builder_cls.return_value.build.return_value = []
+        urns = (
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,DEV)",
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,commerce.orders,PROD)",
+        )
+
+        for dataset_urn in urns:
+            with self.subTest(dataset_urn=dataset_urn):
+                emitter_cls.reset_mock()
+                patch_builder_cls.reset_mock()
+                patch_builder_cls.return_value.build.return_value = []
+
+                record = write_decision_to_datahub(
+                    datahub_url="http://localhost:8080",
+                    dataset_urn=dataset_urn,
+                    decision="ALLOW",
+                    risk_score=50,
+                    severity="medium",
+                    operation="rename",
+                    column="customer_id",
+                )
+
+                patch_builder_cls.assert_called_once_with(dataset_urn)
+                emitter_cls.return_value.test_connection.assert_called_once_with()
+                self.assertEqual(record.dataset_urn, dataset_urn)
 
 
 if __name__ == "__main__":

@@ -86,9 +86,9 @@ class AgentTests(unittest.TestCase):
     def test_persist_decision_calls_writeback_fn_with_confirmation(self):
         calls = []
 
-        def fake_writeback(dataset, decision, score, severity, operation, column):
-            calls.append((dataset, decision, score, severity, operation, column))
-            return {"dataset_urn": f"urn:li:dataset:(x,{dataset},PROD)"}
+        def fake_writeback(dataset_urn, decision, score, severity, operation, column):
+            calls.append((dataset_urn, decision, score, severity, operation, column))
+            return {"dataset_urn": dataset_urn}
 
         agent = ChangeGuardAgent(writeback_fn=fake_writeback)
         result = agent.run(
@@ -100,8 +100,11 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(persist_step.status, StepStatus.SUCCESS)
         self.assertTrue(result.writeback_success)
         self.assertEqual(len(calls), 1)
-        dataset, decision, score, severity, operation, column = calls[0]
-        self.assertEqual(dataset, "commerce.orders")
+        dataset_urn, decision, score, severity, operation, column = calls[0]
+        self.assertEqual(
+            dataset_urn,
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+        )
         self.assertEqual(decision, "BLOCK")
         self.assertEqual(operation, "drop")
         self.assertEqual(column, "customer_id")
@@ -161,11 +164,120 @@ class LiveModeShapeTests(unittest.TestCase):
     def _make_adapter(self, caller):
         return DataHubMCPAdapter(caller, self.TOOLS)
 
+    def _run_zero_confirmed(
+        self,
+        change,
+        *,
+        include_potential=False,
+        writeback_fn=None,
+        confirm_writeback=False,
+    ):
+        resolved_urn = (
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)"
+        )
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": resolved_urn,
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {
+                    "fields": [
+                        {"fieldPath": "order_id"},
+                        {"fieldPath": "customer_id"},
+                    ]
+                }
+            if name == "get_entities":
+                return []
+            if name == "get_lineage" and "column" in arguments:
+                return {"downstreams": {"searchResults": []}}
+            if name == "get_lineage":
+                potential = []
+                if include_potential:
+                    potential.append(
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.sales_summary,PROD)",
+                                "name": "analytics.sales_summary",
+                            }
+                        }
+                    )
+                return {"downstreams": {"searchResults": potential}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        agent = ChangeGuardAgent(
+            mcp_adapter=self._make_adapter(caller), writeback_fn=writeback_fn
+        )
+        return agent.run(change, confirm_writeback=confirm_writeback)
+
+    def test_live_drop_with_zero_confirmed_lineage_requires_review(self):
+        result = self._run_zero_confirmed(
+            Change("commerce.orders", "customer_id", "drop")
+        )
+
+        self.assertEqual(result.decision, "REVIEW")
+        self.assertEqual((result.impact.score, result.impact.severity), (55, "medium"))
+        self.assertIn("Insufficient confirmed", result.decision_reason)
+        self.assertIn("Decision: **REVIEW**", result.report)
+
+    def test_live_rename_with_zero_confirmed_lineage_requires_review(self):
+        result = self._run_zero_confirmed(
+            Change("commerce.orders", "customer_id", "rename", "cust_key")
+        )
+
+        self.assertEqual(result.decision, "REVIEW")
+        self.assertEqual((result.impact.score, result.impact.severity), (45, "medium"))
+
+    def test_live_type_change_with_zero_confirmed_lineage_requires_review(self):
+        result = self._run_zero_confirmed(
+            Change("commerce.orders", "customer_id", "type_change", "string")
+        )
+
+        self.assertEqual(result.decision, "REVIEW")
+        self.assertEqual((result.impact.score, result.impact.severity), (35, "medium"))
+
+    def test_live_add_with_zero_confirmed_lineage_remains_allow(self):
+        result = self._run_zero_confirmed(
+            Change("commerce.orders", "promo_code", "add", "string")
+        )
+
+        self.assertEqual(result.decision, "ALLOW")
+        self.assertEqual((result.impact.score, result.impact.severity), (5, "low"))
+
+    def test_zero_confirmed_with_potential_is_review_and_potential_is_not_scored(self):
+        result = self._run_zero_confirmed(
+            Change("commerce.orders", "customer_id", "drop"),
+            include_potential=True,
+        )
+
+        self.assertEqual(result.decision, "REVIEW")
+        self.assertEqual(result.impact.score, 55)
+        self.assertEqual(result.downstream_assets, [])
+        self.assertEqual(
+            [asset["name"] for asset in result.potential_downstream_assets],
+            ["analytics.sales_summary"],
+        )
+        self.assertIn("table-level potential", result.decision_reason)
+
     def test_resolve_urn_parses_real_search_shape(self):
         async def caller(name, arguments):
             if name == "search":
                 return {
                     "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders_archive,PROD)",
+                                "properties": {"name": "commerce.orders_archive"},
+                            }
+                        },
                         {
                             "entity": {
                                 "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
@@ -188,6 +300,79 @@ class LiveModeShapeTests(unittest.TestCase):
             resolve_step.result["urn"],
             "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
         )
+
+    def test_resolve_urn_rejects_ambiguous_exact_candidates(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        },
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:bigquery,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        },
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "customer_id", "drop")
+        )
+
+        resolve_step = next(s for s in result.steps if s.name == "resolve_urn")
+        self.assertEqual(resolve_step.status, StepStatus.FAILED)
+        self.assertIn("Ambiguous", resolve_step.error)
+        self.assertIsNone(result.impact)
+
+    def test_resolve_urn_rejects_fuzzy_only_results(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders_archive,PROD)",
+                                "properties": {"name": "commerce.orders_archive"},
+                            }
+                        }
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "customer_id", "drop")
+        )
+
+        resolve_step = next(s for s in result.steps if s.name == "resolve_urn")
+        self.assertEqual(resolve_step.status, StepStatus.FAILED)
+        self.assertIn("No exact dataset match", resolve_step.error)
+        self.assertIsNone(result.impact)
+
+    def test_resolve_urn_rejects_exact_result_missing_urn(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {"entity": {"properties": {"name": "commerce.orders"}}}
+                    ]
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "customer_id", "drop")
+        )
+
+        resolve_step = next(s for s in result.steps if s.name == "resolve_urn")
+        self.assertEqual(resolve_step.status, StepStatus.FAILED)
+        self.assertIn("missing URN", resolve_step.error)
+        self.assertIsNone(result.impact)
 
     def test_fetch_lineage_parses_real_downstreams_shape(self):
         async def caller(name, arguments):
@@ -232,6 +417,92 @@ class LiveModeShapeTests(unittest.TestCase):
         lineage_step = next(s for s in result.steps if s.name == "fetch_lineage")
         self.assertEqual(lineage_step.result["source"], "datahub_mcp")
         self.assertEqual(lineage_step.result["assets_found"], 1)
+
+    def test_duplicate_confirmed_lineage_does_not_inflate_score(self):
+        downstream_urn = "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)"
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                if "column" not in arguments:
+                    return {"downstreams": {"searchResults": []}}
+                duplicate = {
+                    "entity": {
+                        "urn": downstream_urn,
+                        "properties": {"name": "analytics.customer_orders"},
+                    },
+                    "lineageColumns": ["customer_id"],
+                }
+                return {"downstreams": {"searchResults": [duplicate, duplicate]}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "customer_id", "rename", "cust_key")
+        )
+
+        self.assertEqual(len(result.downstream_assets), 1)
+        self.assertEqual(result.downstream_assets[0]["urn"], downstream_urn)
+        self.assertEqual(result.impact.score, 50)
+        self.assertEqual(len(result.impact.affected_assets), 1)
+
+    def test_distinct_confirmed_lineage_assets_are_retained(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                if "column" not in arguments:
+                    return {"downstreams": {"searchResults": []}}
+                return {
+                    "downstreams": {
+                        "searchResults": [
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                    "properties": {"name": "analytics.customer_orders"},
+                                },
+                                "lineageColumns": ["customer_id"],
+                            },
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_ltv,PROD)",
+                                    "properties": {"name": "analytics.customer_ltv"},
+                                },
+                                "lineageColumns": ["customer_id"],
+                            },
+                        ]
+                    }
+                }
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "customer_id", "rename", "cust_key")
+        )
+
+        self.assertEqual(len(result.downstream_assets), 2)
+        self.assertEqual(result.impact.score, 55)
 
     def test_live_mode_never_falls_back_to_fixtures_on_lineage_error(self):
         async def caller(name, arguments):
@@ -388,6 +659,92 @@ class LiveModeShapeTests(unittest.TestCase):
         validate_step = next(s for s in result.steps if s.name == "validate_schema")
         self.assertEqual(validate_step.status, StepStatus.SUCCESS)
         self.assertIsNotNone(result.impact)
+
+    def test_live_add_accepts_a_new_column_absent_from_schema(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {
+                    "fields": [
+                        {"fieldPath": "order_id"},
+                        {"fieldPath": "customer_id"},
+                    ]
+                }
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "promo_code", "add")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.SUCCESS)
+        self.assertIsNotNone(result.impact)
+        self.assertEqual(result.impact.score, 5)
+        self.assertEqual(result.impact.severity, "low")
+
+    def test_live_add_rejects_collision_with_existing_column(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "promo_code"}]}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "promo_code", "add")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.FAILED)
+        self.assertIn("already exists", validate_step.error)
+        self.assertIsNone(result.impact)
+
+    def test_live_drop_still_requires_existing_source_column(self):
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,commerce.orders,PROD)",
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "order_id"}]}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        result = ChangeGuardAgent(mcp_adapter=self._make_adapter(caller)).run(
+            Change("commerce.orders", "missing_column", "drop")
+        )
+
+        validate_step = next(s for s in result.steps if s.name == "validate_schema")
+        self.assertEqual(validate_step.status, StepStatus.FAILED)
+        self.assertIn("not found", validate_step.error)
+        self.assertIsNone(result.impact)
 
     def test_potential_downstream_confirmed_and_excludes_duplicates(self):
         """A dataset with confirmed column-level lineage must appear only
@@ -635,6 +992,47 @@ class LiveModeShapeTests(unittest.TestCase):
         # The rest of the pipeline (score/decision) must be unaffected.
         self.assertIsNotNone(result.impact)
 
+    def test_persist_decision_receives_exact_resolved_dataset_urn(self):
+        resolved_urn = (
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,commerce.orders,DEV)"
+        )
+        persisted = []
+
+        async def caller(name, arguments):
+            if name == "search":
+                return {
+                    "searchResults": [
+                        {
+                            "entity": {
+                                "urn": resolved_urn,
+                                "properties": {"name": "commerce.orders"},
+                            }
+                        }
+                    ]
+                }
+            if name == "list_schema_fields":
+                return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_lineage":
+                return {"downstreams": {"searchResults": []}}
+            raise AssertionError(f"unexpected tool call: {name}")
+
+        def fake_writeback(dataset_urn, decision, *args):
+            persisted.append((dataset_urn, decision))
+            return {"dataset_urn": dataset_urn}
+
+        agent = ChangeGuardAgent(
+            mcp_adapter=self._make_adapter(caller), writeback_fn=fake_writeback
+        )
+        result = agent.run(
+            Change("commerce.orders", "customer_id", "drop"),
+            confirm_writeback=True,
+        )
+
+        persist_step = next(s for s in result.steps if s.name == "persist_decision")
+        self.assertEqual(persist_step.status, StepStatus.SUCCESS)
+        self.assertEqual(persisted, [(resolved_urn, "REVIEW")])
+        self.assertEqual(result.decision, "REVIEW")
+
     def test_previous_context_parsed_and_does_not_affect_score(self):
         """When get_entities returns real changeguard_* custom properties
         from a prior run, the agent must surface them as previous_context
@@ -654,9 +1052,9 @@ class LiveModeShapeTests(unittest.TestCase):
                     {
                         "properties": {
                             "customProperties": [
-                                {"key": "changeguard_decision", "value": "BLOCK"},
-                                {"key": "changeguard_risk_score", "value": "60"},
-                                {"key": "changeguard_severity", "value": "high"},
+                                {"key": "changeguard_decision", "value": "REVIEW"},
+                                {"key": "changeguard_risk_score", "value": "55"},
+                                {"key": "changeguard_severity", "value": "medium"},
                                 {"key": "changeguard_operation", "value": "drop"},
                                 {"key": "changeguard_column", "value": "customer_id"},
                                 {"key": "changeguard_timestamp", "value": "2026-08-09T02:40:44+00:00"},
@@ -664,6 +1062,19 @@ class LiveModeShapeTests(unittest.TestCase):
                         }
                     }
                 ]
+            if name == "get_lineage" and "column" in arguments:
+                return {
+                    "downstreams": {
+                        "searchResults": [
+                            {
+                                "entity": {
+                                    "urn": "urn:li:dataset:(urn:li:dataPlatform:snowflake,analytics.customer_orders,PROD)",
+                                    "name": "analytics.customer_orders",
+                                }
+                            }
+                        ]
+                    }
+                }
             if name == "get_lineage":
                 return {"downstreams": {"searchResults": []}}
             raise AssertionError(f"unexpected tool call: {name}")
@@ -674,14 +1085,14 @@ class LiveModeShapeTests(unittest.TestCase):
         result = agent.run(Change("commerce.orders", "customer_id", "rename", "cust_key"))
 
         self.assertIsNotNone(result.previous_context)
-        self.assertEqual(result.previous_context.decision, "BLOCK")
-        self.assertEqual(result.previous_context.risk_score, 60)
+        self.assertEqual(result.previous_context.decision, "REVIEW")
+        self.assertEqual(result.previous_context.risk_score, 55)
         self.assertEqual(result.previous_context.operation, "drop")
 
-        # The CURRENT analysis must be unaffected by the persisted BLOCK:
-        # a rename with no downstream assets in this scenario is a fresh,
-        # independently computed score, not a copy of the old one.
-        self.assertNotEqual(result.impact.score, 60)
+        # The CURRENT analysis must be unaffected by the persisted REVIEW:
+        # confirmed current lineage produces the verified fresh ALLOW result.
+        self.assertEqual(result.impact.score, 50)
+        self.assertEqual(result.decision, "ALLOW")
         context_step = next(s for s in result.steps if s.name == "fetch_previous_context")
         self.assertEqual(context_step.status, StepStatus.SUCCESS)
 

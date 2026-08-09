@@ -253,6 +253,7 @@ class LiveModeShapeTests(unittest.TestCase):
 
         lineage_step = next(s for s in result.steps if s.name == "fetch_lineage")
         self.assertEqual(lineage_step.status, StepStatus.FAILED)
+        self.assertNotEqual(lineage_step.status, StepStatus.WARNING)
         # Live mode must not substitute demo fixtures on failure.
         self.assertEqual(result.downstream_assets, [])
         self.assertIsNone(result.impact)
@@ -472,9 +473,8 @@ class LiveModeShapeTests(unittest.TestCase):
         self.assertEqual(result.impact.severity, "medium")
         self.assertEqual(len(result.impact.affected_assets), 1)
 
-    def test_potential_downstream_failure_does_not_block_pipeline(self):
-        """fetch_potential_downstream is informational only - a failure
-        there must not prevent risk scoring or the final decision."""
+    def test_potential_downstream_warning_preserves_drop_and_rename_decisions(self):
+        """A best-effort table-level failure is WARNING, never policy input."""
 
         async def caller(name, arguments):
             if name == "search":
@@ -485,22 +485,56 @@ class LiveModeShapeTests(unittest.TestCase):
                 }
             if name == "list_schema_fields":
                 return {"fields": [{"fieldPath": "customer_id"}]}
+            if name == "get_entities":
+                return []
             if name == "get_lineage":
                 if "column" in arguments:
-                    return {"downstreams": {"searchResults": []}}
+                    return {
+                        "downstreams": {
+                            "searchResults": [
+                                {
+                                    "entity": {
+                                        "urn": "urn:confirmed",
+                                        "name": "analytics.customer_orders",
+                                    }
+                                }
+                            ]
+                        }
+                    }
                 raise ConnectionError("table-level lineage unavailable")
             raise AssertionError(f"unexpected tool call: {name}")
 
-        adapter = self._make_adapter(caller)
-        agent = ChangeGuardAgent(mcp_adapter=adapter)
-        result = agent.run(Change("commerce.orders", "customer_id", "rename"))
+        cases = (
+            (Change("commerce.orders", "customer_id", "drop"), 60, "high", "BLOCK"),
+            (
+                Change("commerce.orders", "customer_id", "rename", "cust_key"),
+                50,
+                "medium",
+                "ALLOW",
+            ),
+        )
+        for change, score, severity, decision in cases:
+            with self.subTest(operation=change.operation):
+                adapter = self._make_adapter(caller)
+                result = ChangeGuardAgent(mcp_adapter=adapter).run(change)
+                potential_step = next(
+                    s for s in result.steps if s.name == "fetch_potential_downstream"
+                )
+                decision_step = next(s for s in result.steps if s.name == "decision")
 
-        potential_step = next(s for s in result.steps if s.name == "fetch_potential_downstream")
-        self.assertEqual(potential_step.status, StepStatus.FAILED)
-        # Pipeline continues: risk assessment and decision still complete.
-        self.assertIsNotNone(result.impact)
-        decision_step = next(s for s in result.steps if s.name == "decision")
-        self.assertEqual(decision_step.status, StepStatus.SUCCESS)
+                self.assertEqual(potential_step.status, StepStatus.WARNING)
+                self.assertNotEqual(potential_step.status, StepStatus.FAILED)
+                self.assertIn("table-level lineage unavailable", potential_step.error)
+                self.assertIn("Analysis continued", potential_step.result["reason"])
+                self.assertEqual(
+                    (result.impact.score, result.impact.severity), (score, severity)
+                )
+                self.assertEqual(decision_step.result["decision"], decision)
+                self.assertEqual(len(result.downstream_assets), 1)
+                self.assertEqual(result.potential_downstream_assets, [])
+                self.assertEqual(result.warnings, [potential_step.result["reason"]])
+                self.assertIn("## Partial analysis warnings", result.report)
+                self.assertIn(potential_step.result["reason"], result.report)
 
     def test_writeback_skipped_when_save_document_unavailable(self):
         """save_document is an optional Document Tool that mcp-server-datahub

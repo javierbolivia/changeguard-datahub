@@ -19,6 +19,12 @@ from contract_sentinel.agent import (
 from contract_sentinel.datahub_writeback import write_decision_to_datahub
 from contract_sentinel.mcp_connection import create_live_adapter
 from contract_sentinel.risk import Change
+from contract_sentinel.scenarios import (
+    DANGEROUS_DROP,
+    SAFE_RENAME,
+    QuickScenario,
+    streamlit_state_for,
+)
 
 
 # ─── Page Configuration ───────────────────────────────────────────────────────
@@ -91,20 +97,8 @@ if "cg_operation" not in st.session_state:
     st.session_state.cg_operation = "rename"
 if "cg_new_value" not in st.session_state:
     st.session_state.cg_new_value = "cust_key"
-
-
-def _load_safe_rename_example() -> None:
-    st.session_state.cg_dataset = "commerce.orders"
-    st.session_state.cg_column = "customer_id"
-    st.session_state.cg_operation = "rename"
-    st.session_state.cg_new_value = "cust_key"
-
-
-def _load_dangerous_drop_example() -> None:
-    st.session_state.cg_dataset = "commerce.orders"
-    st.session_state.cg_column = "customer_id"
-    st.session_state.cg_operation = "drop"
-    st.session_state.cg_new_value = ""
+def _load_quick_scenario(scenario: QuickScenario) -> None:
+    st.session_state.update(streamlit_state_for(scenario))
 
 
 with st.sidebar:
@@ -114,17 +108,22 @@ with st.sidebar:
     ex_col1, ex_col2 = st.columns(2)
     with ex_col1:
         st.button(
-            "\u25b6 Safe Rename",
+            "\u25b6 Live Safe Rename",
             use_container_width=True,
-            on_click=_load_safe_rename_example,
-            help="Fills the form with a low-risk rename example. Does not run the agent.",
+            on_click=_load_quick_scenario,
+            args=(SAFE_RENAME,),
+            help=(
+                "Loads the verified Live rename scenario. It does not run the "
+                "agent or substitute fixture data."
+            ),
         )
     with ex_col2:
         st.button(
             "\U0001f6d1 Dangerous Drop",
             use_container_width=True,
-            on_click=_load_dangerous_drop_example,
-            help="Fills the form with a high-risk drop example. Does not run the agent.",
+            on_click=_load_quick_scenario,
+            args=(DANGEROUS_DROP,),
+            help="Loads the verified Live drop scenario. Does not run the agent.",
         )
 
     st.markdown("Configure the change you want to evaluate:")
@@ -158,6 +157,7 @@ with st.sidebar:
         "Data Source",
         ["Demo (fixtures)", "Live (DataHub MCP)"],
         index=0,
+        key="cg_mode",
         help="Demo uses reproducible sample data. Live connects to DataHub.",
     )
     confirm_wb = st.checkbox(
@@ -269,6 +269,7 @@ STEP_ICONS = {
     StepStatus.PENDING: "\u23f3",
     StepStatus.RUNNING: "\U0001f504",
     StepStatus.SUCCESS: "\u2705",
+    StepStatus.WARNING: "\u26a0\ufe0f",
     StepStatus.FAILED: "\u274c",
     StepStatus.SKIPPED: "\u23ed\ufe0f",
 }
@@ -296,6 +297,12 @@ def render_step(step: AgentStep, placeholder) -> None:
 
     if step.status == StepStatus.SUCCESS:
         placeholder.success(f"{icon} **{label}**{duration} — {step.description}")
+    elif step.status == StepStatus.WARNING:
+        reason = step.result.get("reason", "") if isinstance(step.result, dict) else ""
+        technical_detail = f" Technical detail: {step.error}" if step.error else ""
+        placeholder.warning(
+            f"{icon} **{label}**{duration} — {reason}{technical_detail}"
+        )
     elif step.status == StepStatus.FAILED:
         placeholder.error(f"{icon} **{label}**{duration} — {step.error}")
     elif step.status == StepStatus.SKIPPED:
@@ -323,7 +330,12 @@ def on_step_update(step: AgentStep) -> None:
         # New step started
         if idx < len(steps_placeholders):
             render_step(step, steps_placeholders[idx])
-    elif step.status in {StepStatus.SUCCESS, StepStatus.FAILED, StepStatus.SKIPPED}:
+    elif step.status in {
+        StepStatus.SUCCESS,
+        StepStatus.WARNING,
+        StepStatus.FAILED,
+        StepStatus.SKIPPED,
+    }:
         # Step completed
         if idx < len(steps_placeholders):
             render_step(step, steps_placeholders[idx])
@@ -414,6 +426,9 @@ if result.impact:
             f"({result.impact.severity}). Not blocked, but review the reasons "
             f"and checklist below before deploying."
         )
+
+    for warning in result.warnings:
+        st.warning(f"\u26a0\ufe0f **Partial analysis:** {warning}")
 
     # ─── DataHub Memory: last persisted ChangeGuard decision ────────────
     # This is context read back from DataHub via get_entities, not a

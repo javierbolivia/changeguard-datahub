@@ -40,6 +40,7 @@ class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
+    WARNING = "warning"
     FAILED = "failed"
     SKIPPED = "skipped"
 
@@ -67,6 +68,7 @@ class AgentResult:
     report: str | None = None
     downstream_assets: list[dict] = field(default_factory=list)
     potential_downstream_assets: list[dict] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     writeback_success: bool = False
     mode: str = "demo"  # "demo" or "live"
     # DataHub Memory: the last ChangeGuard decision persisted on this
@@ -442,9 +444,16 @@ class ChangeGuardAgent:
             except Exception as e:
                 # Informational step only - never block the pipeline or
                 # affect the risk score if this call fails.
-                step3b.status = StepStatus.FAILED
+                warning = (
+                    "Potential downstream propagation unavailable. Analysis "
+                    "continued using confirmed column-level evidence. Risk "
+                    "score was not increased by missing potential evidence."
+                )
+                step3b.status = StepStatus.WARNING
+                step3b.result = {"reason": warning}
                 step3b.error = str(e)
                 step3b.duration_ms = (time.perf_counter() - t0) * 1000
+                result.warnings.append(warning)
         else:
             step3b.status = StepStatus.SKIPPED
             step3b.result = {"reason": "Demo mode — no live table-level lineage to fetch"}
@@ -510,6 +519,7 @@ class ChangeGuardAgent:
                 potential_assets=result.potential_downstream_assets,
                 previous_context=result.previous_context,
                 remediation=result.remediation,
+                warnings=result.warnings,
             )
             result.report = report
             step5.result = {"report_length": len(report), "has_checklist": True}

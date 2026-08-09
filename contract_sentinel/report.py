@@ -14,8 +14,10 @@ def render_markdown(
     potential_assets: list[dict] | None = None,
     previous_context: PersistedContext | None = None,
     remediation: RemediationPlan | None = None,
+    warnings: list[str] | None = None,
 ) -> str:
     potential_assets = potential_assets or []
+    warnings = warnings or []
     lines = [
         "# ChangeGuard Impact Report",
         "",
@@ -26,6 +28,9 @@ def render_markdown(
         "## Why this was flagged",
     ]
     lines.extend(f"- {reason}" for reason in impact.reasons)
+    if warnings:
+        lines.extend(["", "## Partial analysis warnings"])
+        lines.extend(f"- {warning}" for warning in warnings)
     lines.extend(
         [
             "",

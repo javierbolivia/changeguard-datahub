@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import json
 import sys
+import traceback
 from dataclasses import asdict
 
 from .agent import AgentResult, ChangeGuardAgent, StepStatus
@@ -48,8 +49,17 @@ EXIT_BLOCK = 1
 EXIT_ERROR = 2
 
 
+class _ArgumentParseError(ValueError):
+    """Raised instead of SystemExit for invalid command-line arguments."""
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _ArgumentParseError(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="python -m contract_sentinel.cli",
         description=(
             "ChangeGuard CI/CD gate: evaluate a proposed schema change "
@@ -138,6 +148,9 @@ def _human_report(args: argparse.Namespace, result: AgentResult, decision: str) 
     lines.extend(f"- {asset['name']}" for asset in result.downstream_assets)
     lines.append("Potential:")
     lines.extend(f"- {asset['name']}" for asset in result.potential_downstream_assets)
+    if result.warnings:
+        lines.append("Warnings:")
+        lines.extend(f"- {warning}" for warning in result.warnings)
     if result.remediation is not None:
         lines.append("Remediation:")
         lines.append(result.remediation.summary)
@@ -160,6 +173,7 @@ def _json_report(args: argparse.Namespace, result: AgentResult, decision: str) -
         "confirmed_affected_assets": len(result.downstream_assets),
         "potential_downstream_assets": len(result.potential_downstream_assets),
         "mode": result.mode,
+        "warnings": result.warnings,
         "remediation": (
             asdict(result.remediation) if result.remediation is not None else None
         ),
@@ -206,14 +220,32 @@ async def _run(args: argparse.Namespace) -> tuple[AgentResult | None, str | None
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(raw_argv)
+    except _ArgumentParseError as e:
+        if "--json" in raw_argv:
+            print(json.dumps({"error": f"Invalid arguments: {e}"}))
+        else:
+            parser.print_usage(sys.stderr)
+            print(f"{parser.prog}: error: {e}", file=sys.stderr)
+        return EXIT_ERROR
 
     if args.operation == "rename" and not args.new_name:
         _emit_error("--new-name is required when --operation rename", args)
         return EXIT_ERROR
 
-    result, connection_error = asyncio.run(_run(args))
+    try:
+        result, connection_error = asyncio.run(_run(args))
+    except Exception as e:
+        message = f"Unexpected execution error: {e}"
+        if args.json:
+            print(message, file=sys.stderr)
+        else:
+            traceback.print_exc(file=sys.stderr)
+        _emit_error(message, args)
+        return EXIT_ERROR
 
     if connection_error:
         _emit_error(

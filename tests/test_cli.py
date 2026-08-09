@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from contract_sentinel import cli
@@ -114,8 +115,7 @@ def _run_cli(argv):
 
 class CliExitCodeTests(unittest.TestCase):
     def test_allow_decision_exits_zero(self):
-        """rename in demo mode is well below the BLOCK threshold with no
-        downstream fixtures beyond the default set -> ALLOW -> exit 0."""
+        """The verified rename in patched Live mode is ALLOW -> exit 0."""
         with _patched_live_adapter():
             exit_code, out = _run_cli(
                 [
@@ -227,6 +227,27 @@ class CliExitCodeTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, cli.EXIT_ERROR)
 
+    def test_unexpected_execution_exception_exits_two(self):
+        async def failing_run(args):
+            raise RuntimeError("unexpected agent failure")
+
+        stderr = io.StringIO()
+        with patch.object(cli, "_run", failing_run), contextlib.redirect_stderr(stderr):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "drop",
+                ]
+            )
+
+        self.assertEqual(exit_code, cli.EXIT_ERROR)
+        self.assertEqual(out, "")
+        self.assertIn("unexpected agent failure", stderr.getvalue())
+
 
 class CliJsonOutputTests(unittest.TestCase):
     def test_json_output_is_valid_json(self):
@@ -307,6 +328,115 @@ class CliJsonOutputTests(unittest.TestCase):
         self.assertFalse(payload["remediation"]["required"])
         self.assertNotIn("blocked", payload["remediation"]["summary"].casefold())
         self.assertEqual(exit_code, cli.EXIT_ALLOW)
+
+    def test_json_unexpected_execution_error_is_valid_and_exits_two(self):
+        async def failing_run(args):
+            raise RuntimeError("unexpected agent failure")
+
+        stderr = io.StringIO()
+        with patch.object(cli, "_run", failing_run), contextlib.redirect_stderr(stderr):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "drop",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_ERROR)
+        self.assertIn("unexpected agent failure", payload["error"])
+        self.assertIn("unexpected agent failure", stderr.getvalue())
+
+    def test_json_connection_error_is_valid_and_exits_two(self):
+        async def failing_adapter(datahub_url, datahub_token=None):
+            raise ConnectionError("DataHub GMS unreachable")
+
+        with patch.object(cli, "create_live_adapter", failing_adapter):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "drop",
+                    "--mode",
+                    "live",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_ERROR)
+        self.assertIn("DataHub GMS unreachable", payload["error"])
+
+    def test_json_invalid_arguments_are_machine_readable(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code, out = _run_cli(["--json", "--operation", "invalid"])
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_ERROR)
+        self.assertIn("Invalid arguments", payload["error"])
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_json_warning_remains_successful_and_machine_readable(self):
+        base_caller = _make_live_caller()
+
+        async def caller(name, arguments):
+            if name == "get_lineage" and "column" not in arguments:
+                raise TimeoutError("table-level lineage timed out")
+            return await base_caller(name, arguments)
+
+        async def warning_adapter(datahub_url, datahub_token=None):
+            return DataHubMCPAdapter(caller, TOOLS)
+
+        with patch.object(cli, "create_live_adapter", warning_adapter):
+            exit_code, out = _run_cli(
+                [
+                    "--dataset",
+                    "commerce.orders",
+                    "--column",
+                    "customer_id",
+                    "--operation",
+                    "rename",
+                    "--new-name",
+                    "cust_key",
+                    "--mode",
+                    "live",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(out)
+        self.assertEqual(exit_code, cli.EXIT_ALLOW)
+        self.assertEqual(payload["risk_score"], 50)
+        self.assertEqual(payload["decision"], "ALLOW")
+        self.assertEqual(payload["potential_downstream_assets"], 0)
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertIn("Potential downstream propagation unavailable", payload["warnings"][0])
+
+
+class GithubActionsExampleTests(unittest.TestCase):
+    def test_example_installs_uv_and_preserves_exit_semantics(self):
+        workflow = (
+            Path(__file__).resolve().parents[1] / "examples" / "github-actions-gate.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("astral-sh/setup-uv@", workflow)
+        self.assertIn("version: \"0.12.3\"", workflow)
+        self.assertIn("set +e", workflow)
+        self.assertIn('1)', workflow)
+        self.assertIn('ChangeGuard BLOCK', workflow)
+        self.assertIn('2)', workflow)
+        self.assertIn('ChangeGuard ERROR', workflow)
+        self.assertIn('exit "$changeguard_status"', workflow)
+        self.assertNotIn("continue-on-error: true", workflow)
 
 
 class CliReusesExistingEngineTests(unittest.TestCase):

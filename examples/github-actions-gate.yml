@@ -26,6 +26,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install uv (provides uvx)
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -33,6 +38,7 @@ jobs:
         # A real workflow would derive --dataset/--column/--operation from
         # the PR's migration file instead of hardcoding them here.
         run: |
+          set +e
           python -m contract_sentinel.cli \
             --dataset commerce.orders \
             --column customer_id \
@@ -41,8 +47,24 @@ jobs:
             --datahub-url ${{ secrets.DATAHUB_GMS_URL }} \
             --datahub-token ${{ secrets.DATAHUB_TOKEN }} \
             --json
-        # Exit code from this step becomes the job's outcome directly:
-        #   0 (ALLOW) -> step succeeds, job continues
-        #   1 (BLOCK) -> step fails, job fails, PR check is red
-        #   2 (ERROR) -> step fails, job fails (dataset/column not found,
-        #                DataHub unreachable, invalid arguments, etc.)
+          changeguard_status=$?
+          set -e
+
+          case "$changeguard_status" in
+            0)
+              echo "::notice title=ChangeGuard ALLOW::Schema change may proceed."
+              ;;
+            1)
+              echo "::error title=ChangeGuard BLOCK::Policy gate rejected the schema change."
+              ;;
+            2)
+              echo "::error title=ChangeGuard ERROR::The gate could not complete its analysis."
+              ;;
+            *)
+              echo "::error title=ChangeGuard ERROR::Unexpected exit code $changeguard_status."
+              changeguard_status=2
+              ;;
+          esac
+
+          # BLOCK and ERROR still fail the step/job; only ALLOW continues.
+          exit "$changeguard_status"

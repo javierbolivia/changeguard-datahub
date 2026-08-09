@@ -365,7 +365,7 @@ python -m contract_sentinel.cli \
 - **exit 1** = `BLOCK`
 - **exit 2** = execution/configuration error (dataset not found, column not found, DataHub/MCP unreachable, invalid arguments)
 
-The CLI never writes back to DataHub (`confirm_writeback=False` always), so it is safe to run unattended in CI. See [`examples/github-actions-gate.yml`](examples/github-actions-gate.yml) for a small conceptual GitHub Actions workflow example — it is not wired into this repository's own Actions.
+The CLI never writes back to DataHub (`confirm_writeback=False` always), so it is safe to run unattended in CI. See [`examples/github-actions-gate.yml`](examples/github-actions-gate.yml) for a small conceptual GitHub Actions workflow example. The example installs `uv`/`uvx`, labels BLOCK separately from execution ERROR, and still fails the job for either outcome; it is not wired into this repository's own Actions.
 
 ---
 
@@ -470,7 +470,7 @@ See the full output: [`examples/changeguard-impact-report.md`](examples/changegu
 - The agent requires `get_lineage_paths_between` to be advertised by the MCP server to connect, but does not currently call it — see [DataHub MCP Integration](#datahub-mcp-integration).
 - `get_entities` does not return `ownership`, `domain`, or `tags` in the current `mcp-server-datahub` response shape, and our seeded local DataHub instance has none of these set on any dataset either (confirmed directly via DataHub's GraphQL API during investigation). ChangeGuard therefore does not display ownership/domain/tags for Live-mode assets — see [DataHub Memory](#datahub-memory) for what `get_entities` is used for instead.
 - Ownership, criticality, and dashboard classification of downstream assets in Live mode are not yet sourced from DataHub — `critical` is always `false` and `owner` is always `"Unknown"` for Live-mode results, since the agent does not call the tools that would supply that data. This means the risk score's "critical asset" and "business dashboard" bonus factors never trigger in Live mode today (they only apply in Demo mode, where fixtures set `critical: true` on some assets).
-- Potential downstream propagation depends on table-level `get_lineage`. An incomplete table-level graph can omit potential assets, and this informational call has been observed to time out intermittently on the local development machine; its failure does not block scoring or the final decision.
+- Potential downstream propagation depends on table-level `get_lineage`. An incomplete table-level graph can omit potential assets, and this informational call has been observed to time out intermittently on the local development machine; its failure is surfaced as a partial-analysis warning and does not block scoring or the final decision.
 - On Windows, a Live CLI run may emit an `asyncio`/`ResourceWarning` during interpreter shutdown after the result has already been printed. The warning does not change the result or exit code.
 - The CI/CD gate (`contract_sentinel/cli.py`, see [CI/CD Gate](#cicd-gate) below) never writes back to DataHub — it always runs with `confirm_writeback=False`, so it is safe to run unattended, but it cannot be used to persist a decision the way the Streamlit UI can.
 - The decision-persistence writeback (custom properties) has been verified against a local DataHub OSS quickstart instance only, not against DataHub Cloud or a production deployment.
